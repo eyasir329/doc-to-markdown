@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Unit tests
+        run: python -m pytest -q dev/test_pipeline.py
+      - name: End-to-end test (fake Marker, no GPU)
+        run: python dev/test_e2e.py
+      - name: Notebook matches its sources
+        run: |
+          python dev/build_nb.py
+          git diff --exit-code -- docs_to_markdown_cloudflare.ipynb || { echo "::error::Run 'python dev/build_nb.py' and commit the notebook"; exit 1; }

@@ -1,0 +1,11 @@
+# To run the tests and build the notebook on your PC (Python 3.10+).
+# The client (md_client.py) itself needs nothing beyond the Python standard library.
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+numpy>=1.26
+scipy>=1.11
+pillow>=10.0
+pypdfium2>=4.30
+pytest>=8.0
+ruff>=0.5

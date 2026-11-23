@@ -1,0 +1,27 @@
+# secrets: never commit your box token
+.box_token
+*.token
+.env
+
+# conversion output and local test material
+markdown_out/
+test_out/
+*.md.bak
+dev/suite_checks.py
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+
+# notebooks / editors / OS
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

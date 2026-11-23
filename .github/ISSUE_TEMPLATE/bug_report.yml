@@ -1,0 +1,42 @@
+name: Bug report
+description: A crash, hang, error message or option that doesn't work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please don't paste your BOX_TOKEN or tunnel URL, and remove private data from logs.
+        For a document that converts *badly* (wrong text, lost table, bad figure), use the "Conversion quality" form instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and client output
+      description: The `md_client.py` command you ran and its output.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: kaggle-log
+    attributes:
+      label: Kaggle log
+      description: The relevant part of the notebook's log (the section that failed, or the lines around the error).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit of this repository.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Your PC
+      description: Operating system and `python --version`; whether you use `--local`.

@@ -1,0 +1,47 @@
+name: Conversion quality
+description: A document converts badly - lost or wrong text, tables, equations, figures or diagrams
+labels: [quality]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are what make the project better. **Never attach documents with personal or confidential data.**
+        One page that shows the problem is ideal.
+  - type: textarea
+    id: page
+    attributes:
+      label: What the page shows
+      description: Describe (or attach a screenshot of) the part of the page that goes wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: markdown
+    attributes:
+      label: What the Markdown has instead
+      description: Paste the relevant Markdown.
+      render: markdown
+    validations:
+      required: true
+  - type: dropdown
+    id: quality
+    attributes:
+      label: Quality mode
+      options: [balanced (default), fast, accurate, several / all]
+    validations:
+      required: true
+  - type: input
+    id: options
+    attributes:
+      label: Other options
+      description: e.g. `--mode vllm`, `--force-ocr`, `--office native`
+  - type: textarea
+    id: report
+    attributes:
+      label: report.json row
+      description: The document's row from `report.json` (it shows the checks, fixes and refusals).
+      render: json
+  - type: textarea
+    id: sample
+    attributes:
+      label: Sample document
+      description: Attach a PDF or image of the page if you can share it (drag and drop here).

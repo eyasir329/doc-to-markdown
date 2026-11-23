@@ -1,0 +1,4 @@
+# Optional: Marker workers on your own PC (md_client.py --local), next to the Kaggle box.
+# Use exactly the Marker version the notebook pins (MARKER_SOURCE in dev/notebook/02_config.py).
+marker-pdf[full] @ git+https://github.com/datalab-to/marker.git@b578dc88412984b7531bd4a5b4886eb2d2c58da1
+scipy>=1.11

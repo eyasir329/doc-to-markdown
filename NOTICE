@@ -1,0 +1,30 @@
+doc-to-markdown
+Copyright 2026 The doc-to-markdown contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes one third-party file:
+
+- dev/fixtures/llama_server_help_b12627.md - a copy of llama.cpp's server README (release
+  b12627), used by the tests to check which llama-server flags exist.
+  Copyright (c) 2023-2026 The ggml authors. MIT License: see dev/fixtures/LICENSE.llama.cpp.
+
+It includes no third-party code or model weights. At run time, the Kaggle notebook
+downloads and uses the following components, each under its own license:
+
+- Marker (https://github.com/datalab-to/marker) - code: Apache License 2.0.
+  Its model weights (Surya, layout) use a modified AI Pubs Open RAIL-M license: free for
+  research, personal use and startups under the funding/revenue limit stated by Datalab;
+  larger commercial use needs a licence from Datalab (https://www.datalab.to/pricing).
+- Surya 2.5 GGUF model (via Marker/Datalab) - as above.
+- Qwen3-VL-8B-Instruct (https://huggingface.co/Qwen) - Apache License 2.0; the GGUF
+  quantisation used is published by Unsloth (https://huggingface.co/unsloth).
+- llama.cpp (https://github.com/ggml-org/llama.cpp) - MIT License.
+- cloudflared (https://github.com/cloudflare/cloudflared) - Apache License 2.0.
+- LibreOffice (https://www.libreoffice.org) - Mozilla Public License 2.0.
+- DjVuLibre (ddjvu) - GNU GPL 2.0 (used as a separate program).
+- Python packages installed by the notebook (FastAPI, Uvicorn, HTTPX, NumPy, SciPy, Pillow,
+  pypdfium2, ...) - their respective licenses.
+
+Users are responsible for complying with these licenses, in particular the model-weight
+licenses, for their use case.
