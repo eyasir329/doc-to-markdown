@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/eyasir329/doc-to-markdown/security/advisories/new
+    about: Please report security problems privately, not as a public issue (see SECURITY.md).
+  - name: Documentation
+    url: https://github.com/eyasir329/doc-to-markdown/tree/main/docs
+    about: Setup, usage, quality modes, configuration and troubleshooting guides.
