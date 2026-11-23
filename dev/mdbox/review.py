@@ -909,7 +909,7 @@ def finish_markdown(md_path, keep_pages=False):
     if not keep_pages:
         parts = PAGE_SPLIT.split(md)
         md = join_pages([parts[0]] + parts[2::2])
-    md_path.write_text(tidy(md), encoding="utf-8")
+    md_path.write_text(no_src_images(tidy(md)), encoding="utf-8")      # table icons fix_tables could not crop: their alt text
 
 
 # ----------------------------------------------------------------- Markdown syntax, deterministic
@@ -977,14 +977,21 @@ NUM_AT_END = re.compile(EQ_NUM + r"\s*$")
 NO_SRC_IMG = re.compile(r'<img(?![^>]*\bsrc=)[^>]*?\balt="([^"]*)"[^>]*>(?:\s*<br\s*/?>)?\s*')
 
 
+def no_src_images(text, tables=True):
+    """an <img> with no picture (an icon Marker did not save) becomes its alt text unless the same words follow it
+    ("<img alt="surfel"><br/>surfel</img>" -> "surfel"). tables=False leaves table rows alone: fix_tables (after the review)
+    crops those pictures from the page's grid, and finish_markdown() turns any it could not crop into text"""
+    def one(line):
+        def img(m):
+            rest = line[m.end():m.end() + len(m.group(1)) + 2]
+            return "" if m.group(1) and rest.lower().startswith(m.group(1).lower()) else (m.group(1) + " " if m.group(1) else "")
+        return re.sub(r"</img>", "", NO_SRC_IMG.sub(img, line))
+    return "\n".join(line if not tables and line.lstrip().startswith("|") else one(line) for line in text.split("\n"))
+
+
 def _html_bits(seg):
-    """Marker's HTML left in tables: an <img> with no picture (an icon it did not save) is its alt text unless the same words
-    follow it ("<img alt="surfel"><br/>surfel</img>" -> "surfel"); <b>/<i> are Markdown bold/italic"""
-    def img(m):
-        rest = seg[m.end():m.end() + len(m.group(1)) + 2]
-        return "" if m.group(1) and rest.lower().startswith(m.group(1).lower()) else (m.group(1) + " " if m.group(1) else "")
-    seg = NO_SRC_IMG.sub(img, seg)
-    seg = re.sub(r"</img>", "", seg)
+    """Marker's HTML: pictureless <img> outside tables (see no_src_images); <b>/<i> are Markdown bold/italic"""
+    seg = no_src_images(seg, tables=False)
     seg = re.sub(r"<b>([^<\n]+)</b>", r"**\1**", seg)
     return re.sub(r"<i>([^<\n]+)</i>", r"*\1*", seg)
 

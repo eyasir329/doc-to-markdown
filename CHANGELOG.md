@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+- Pictures inside table cells were turned into plain text by the Markdown tidy-up before they could be cropped from the page; they are kept again.
+
 ## [1.0.0] - 2026-11-23
 
 First public release.

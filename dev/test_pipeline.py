@@ -958,8 +958,20 @@ class TestSuiteFindings(unittest.TestCase):
 
     def test_table_html_from_marker(self):
         """Case 05: icon cells came out as <img alt="surfel"><br/>surfel</img>, and <b>P</b>"""
-        out = R.tidy('| <img alt="surfel"><br/>surfel</img> | <img alt="lone icon"/> | <b>P</b> (see below) |')
-        self.assertEqual(out.strip(), "| surfel | lone icon | **P** (see below) |")
+        row = '| <img alt="surfel"><br/>surfel</img> | <img alt="lone icon"/> | <b>P</b> (see below) |'
+        out = R.tidy(row)          # during the review: the icons stay for fix_tables to crop (it runs later)
+        self.assertIn('<img alt="surfel">', out)
+        self.assertIn("**P** (see below)", out)
+        self.assertEqual(R.no_src_images(out).strip(), "| surfel | lone icon | **P** (see below) |")   # left uncropped: text
+        self.assertEqual(R.tidy('An icon <img alt="key point"> here.').strip(), "An icon key point here.")   # outside tables at once
+
+    def test_table_icons_survive_until_fix_tables(self):
+        """full-suite regression: tidy() in the review turned <img alt="surfel"> into text before fix_tables could crop it"""
+        with tempfile.TemporaryDirectory() as d:
+            md = Path(d) / "x.md"
+            md.write_text("| A | B |\n|---|---|\n| <img alt=\"surfel\"><br/>surfel</img> | 1 |\n")
+            R.finish_markdown(md)
+            self.assertEqual(md.read_text().strip().split("\n")[-1].replace(" ", ""), "|surfel|1|")
 
     def test_heading_not_flattened_by_review(self):
         draft = "## Case 08: Flight Delay Plot\n\nSome text here."
