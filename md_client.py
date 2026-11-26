@@ -550,6 +550,7 @@ class Run:
         self.inflight, self.uploading, self.upload_error = {}, 0, None   # box jobs: jid -> item {unit, batch, dest, label}
         self.chunks, self.held, self.rows, self.last = {}, {}, [], {}   # chunks: jid -> [pending stolen chunks]; held: jid -> item
         self.box_cap, self.done_chunks, self.local_fails, self.box_waiting = 2, [], 0, 0
+        self.converting = set()                                         # box jobs whose page chunks are queued (stealable)
         self.active = None                                              # the document being converted batch by batch
         self.batch_pages = 0
 
@@ -607,7 +608,6 @@ class Run:
     def add_job(self, jid, item):
         with self.lock:
             self.inflight[jid] = item; self.box_waiting = 1               # until the next /health shows the box's real queue
-            self.last["steal"] = 0                                        # a new job has fresh chunks: the PC may take some now
 
     def signature(self):
         return batch_signature(self.options, getattr(self, "box_defaults", {}))
@@ -674,6 +674,10 @@ class Run:
     def poll_box(self):
         for jid, item in list(self.inflight.items()):
             st = self.box.call("GET", f"/jobs/{jid}")
+            if st.get("stage") == "converting" and jid not in self.converting:
+                self.converting.add(jid); self.last["steal"] = 0          # its page chunks are queued now: the PC may take some at once
+            if st["status"] in ("done", "error", "cancelled"):
+                self.converting.discard(jid)
             line = f"  [{item['label']}] {st['status']}" + (f" {st.get('pct', 0):.0f}%" if st["status"] == "running" else "") + (f" · {st['msg']}" if st.get("msg") else "")
             if line != self.last.get(jid):
                 print(line[:220]); self.last[jid] = line
@@ -773,6 +777,8 @@ class Run:
                 u = item["unit"]
                 if free <= 0 or u["zip"] or u["path"].suffix.lower() != ".pdf":      # page numbers must match the file here
                     continue
+                if jid not in self.converting:    # still being prepared (scans set upright first): no chunks yet. Asking then
+                    continue                      # started the 3 s wait, and a fast box took every chunk before the next try
                 for c in self.box.call("POST", f"/jobs/{jid}/steal", {"n": free}).get("chunks", []):
                     cdir = Path(self.tmp) / "chunks" / jid / c["pages"].replace(",", "_")
                     self.local.submit({"kind": "chunk", "jid": jid, "chunk": c, "label": f"{u['label']} p.{c['pages']}", "dir": cdir},

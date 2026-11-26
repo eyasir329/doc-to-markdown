@@ -162,6 +162,7 @@ where a page was converted. The client keeps one queue, biggest files first:
 - **The box** gets the next file from the front when it has no unclaimed tasks.
 - **Your PC** takes files from the back, the smallest ones.
 - **Stealing.** When your PC runs out of work, it steals not-yet-started chunks from the end of the box's long
-  PDFs (not from documents whose pages the box turned or cut: the page numbers would differ).
+  PDFs, as soon as the box has queued them (not from documents whose pages the box turned or cut: the page
+  numbers would differ).
 - **Failures.** A file that fails on your PC goes to the box. After 3 failures in a row, everything goes to the
   box.

@@ -9,3 +9,6 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 3
+    # the requirements are lower bounds and CI installs the newest versions anyway; raising a minimum only drops
+    # Python 3.10 (Pillow 13, FastAPI 0.165 and SciPy 1.18 need 3.11 or 3.12). Only bump what a range excludes
+    versioning-strategy: increase-if-necessary

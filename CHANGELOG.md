@@ -56,6 +56,9 @@ passed in every mode.
   one job at a time prepares scans (each starts two processes the memory guard can't see); scanned pages' text
   lines are detected once instead of twice.
 - A prose rewrite answered for "paragraph 0" replaced the last paragraph of its batch.
+- Workers on your PC asked the box for page chunks while it was still preparing a job; the empty answer delayed
+  their next request by 3 s, long enough for a fast box to take every chunk itself. They now ask as soon as the
+  job's chunks are queued.
 - The API answered malformed sizes, part counts and bodies with 500; they are 400 now.
 - Pictures inside table cells were turned into plain text by the Markdown tidy-up before they could be cropped
   from the page; they are kept again.

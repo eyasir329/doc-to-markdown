@@ -2129,6 +2129,39 @@ class BatchOverlap(unittest.TestCase):
         self.assertTrue(all((run.parts_dir(u, b) / "done.json").is_file() for b in jobs))
 
 
+class PcStealing(unittest.TestCase):
+    def test_pc_asks_for_chunks_only_once_they_exist(self):
+        """CI (GitHub runners): the PC asked for page chunks while the box was still preparing the job (scans set upright
+        first, no chunks yet); the empty answer started a 3 s wait, and a fast box's worker took every chunk meanwhile. Now
+        the PC asks only once the job converts, and at once"""
+        import importlib.util, threading, time
+        spec = importlib.util.spec_from_file_location("md_client", Path(__file__).parent.parent / "md_client.py")
+        mc = importlib.util.module_from_spec(spec); spec.loader.exec_module(mc)
+        run = object.__new__(mc.Run)
+        stage, steals = ["preparing"], []
+
+        def call(_, method, path, body=None, *a, **k):
+            if path.endswith("/steal"):
+                steals.append(time.time()); return {"chunks": []}
+            return {"status": "done" if stage[0] == "done" else "running", "stage": stage[0], "pct": 1, "msg": ""}
+        run.box = type("B", (), {"call": call})()
+        run.local = type("L", (), {"free": lambda self: 2, "can_take": lambda self, *a: False, "opts": {}})()
+        run.lock, run.queue, run.options, run.split_min, run.tmp = threading.Lock(), [], {}, 20, TMP
+        run.last, run.chunks, run.local_fails, run.held, run.converting = {}, {}, 0, {}, set()
+        run.inflight = {"j1": {"unit": {"zip": False, "path": Path("big.pdf"), "label": "big.pdf"}, "label": "big.pdf p.0-23"}}
+        run.feed_local(); run.poll_box(); run.feed_local()
+        self.assertEqual(steals, [])                          # preparing: nothing to take, so no question (and no wait)
+        stage[0] = "converting"
+        run.poll_box(); run.feed_local()
+        self.assertEqual(len(steals), 1)                      # its chunks are queued: asked at once
+        run.feed_local()
+        self.assertEqual(len(steals), 1)                      # an empty answer: the next question waits as before
+        stage[0] = "done"
+        run.collect_box = lambda jid, item, st: None
+        run.poll_box()
+        self.assertEqual(run.converting, set())               # a finished job is forgotten
+
+
 def _photo(spread=True, title=False, seed=1):
     """a synthetic photo: paper on a dark table, text as word-like strokes in left-aligned lines with ragged ends (and short
     paragraph ends); spread = two pages with a wide fold, else one page with a narrow column gap (and a headline across)"""
