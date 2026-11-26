@@ -497,6 +497,10 @@ def _take_chunk(chunk_dir, doc_dir, stem, meta):
     for f in chunk_dir.iterdir():
         if f.is_file() and f.name not in (f"{stem}.md", f"{stem}_meta.json"):
             os.replace(f, doc_dir / f.name)
+    if (chunk_dir / "layout").is_dir():               # --show-layout: each page's detected blocks, drawn (worker.layout_of)
+        (doc_dir / "layout").mkdir(exist_ok=True)
+        for f in (chunk_dir / "layout").iterdir():
+            os.replace(f, doc_dir / "layout" / f.name)
     return text.strip("\n")
 
 

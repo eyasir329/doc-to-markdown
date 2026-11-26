@@ -32,6 +32,8 @@ jobs:
         run: python -m pytest -q dev/test_pipeline.py
       - name: End-to-end test (fake Marker, no GPU)
         run: python dev/test_e2e.py
+      - name: Quality modes (fake servers, vision-LLM requests per mode)
+        run: python dev/modes_check.py
       - name: Notebook matches its sources
         run: |
           python dev/build_nb.py

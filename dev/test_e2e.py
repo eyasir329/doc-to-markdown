@@ -74,13 +74,15 @@ class EndToEnd(unittest.TestCase):
             spec = importlib.util.spec_from_file_location("md_client", ROOT / "md_client.py"); mc = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mc)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/health", headers={"Authorization": f"Bearer {TOKEN}"})
-            sig = mc.batch_signature({}, mc.box_defaults(json.load(urllib.request.urlopen(req, timeout=10))))
+            sig = mc.batch_signature({"QUALITY": "precise"},                      # the run below asks for precise
+                                     mc.box_defaults(json.load(urllib.request.urlopen(req, timeout=10))))
             (seed.parent / "done.json").write_text(json.dumps({"ok": True, "pages": 24, "where": "box", "batch": "24-47", "options": sig}))
             # a batch saved with other settings (here: before the page review existed) is converted again
             old = out / ".big.parts" / "00048-00071"; (old / "big").mkdir(parents=True)
             (old / "done.json").write_text(json.dumps({"ok": True, "pages": 24, "where": "box", "batch": "48-71"}))
             r = subprocess.run([sys.executable, str(ROOT / "md_client.py"), str(docs), "--url", f"http://127.0.0.1:{port}", "--token", TOKEN,
-                                "--local", "2", "--out", str(out)], env=dict(env, FAKE_HOST="pc"), capture_output=True, text=True, timeout=300)
+                                "--local", "2", "--out", str(out), "--quality", "precise"],   # precise: the LLM describes figures
+                               env=dict(env, FAKE_HOST="pc"), capture_output=True, text=True, timeout=300)
             log = r.stdout + r.stderr
             if os.environ.get("SHOW"):
                 print(log)

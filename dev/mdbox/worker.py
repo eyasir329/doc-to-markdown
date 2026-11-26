@@ -9,6 +9,7 @@ from pathlib import Path
 import convert as C
 import figures as FIG
 import review as R
+import spreads as SP
 
 POOL, WID, VLM_URL, PARALLEL = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 CPU_THREADS = int(sys.argv[5]) if len(sys.argv) > 5 else 2
@@ -102,6 +103,90 @@ MODELS["indra_model"].threads = CPU_THREADS      # onnxruntime threads: the pool
 log(f"models ready in {time.time() - t0:.1f}s | VLM: {VLM_URL or 'none (fast / no_ocr only)'} | LibreOffice: {C.SOFFICE or 'none'}")
 
 
+PICTURE_MIN_PX = 200       # smaller pictures (icons, logos) hold no text worth reading
+
+
+def ocr_pictures(md, out, opts, skip, insert=True):
+    """express: the text inside each picture, read by Marker with OCR forced (Surya), under the picture
+    -> (pictures read, {picture: why not}, {picture: what Surya read}). insert=False (standard, precise): the Markdown is left alone, the
+    readings are hints for the vision LLM's descriptions. skip: pictures the layout found text blocks in (read too, but kept
+    only when mostly new: Marker drops a diagram's labels)"""
+    from PIL import Image
+    import re
+    text, n, why = md.read_text(encoding="utf-8"), 0, {}
+    names = dict.fromkeys(re.findall(r"!\[[^\]]*\]\(([^)\s]+\.(?:jpe?g|png))\)", text))
+    todo = []
+    for name in names:
+        path = out / name
+        if re.search(r"_(Formula|Table)_", name) or not path.is_file():
+            continue                                  # a formula / an icon in a table
+        with Image.open(path) as im:
+            if min(im.size) >= PICTURE_MIN_PX:
+                todo.append(name)
+            else:
+                why[name] = "small"
+    readings = {}
+    if not todo:
+        return 0, why, readings
+
+    def read(names, **marker):
+        """one Marker call for all of them: one page per picture, read side by side -> {name: text}"""
+        with tempfile.TemporaryDirectory() as d:
+            pdf = Path(d) / "pictures.pdf"
+            pages = []
+            for name in names:                        # as Marker reads a lone image: native size, small ones doubled for OCR
+                with Image.open(out / name) as im:
+                    im = im.convert("RGB")
+                    pages.append(im if max(im.size) >= 1000 else im.resize((im.width * 2, im.height * 2), Image.LANCZOS))
+            pages[0].save(pdf, save_all=True, append_images=pages[1:], resolution=192)   # Marker OCRs pages at 192 dpi
+            for im in pages:
+                im.close()
+            cli = cli_options(dict(opts, FORCE_OCR=True, IMAGES=False, PAGE_RANGE=None, PAGINATE=True,
+                                   OUTPUT_FORMAT="markdown", USE_LLM=False), Path(d))
+            cli.update(marker)
+            cp = ConfigParser(cli)
+            conv = PdfConverter(config=cp.generate_config_dict(), artifact_dict=MODELS, processor_list=cp.get_processors(),
+                                renderer=cp.get_renderer(), llm_service=None)
+            per_page = FIG.ocr_pages(getattr(conv(str(pdf)), "markdown", ""))
+        return {name: per_page.get(k, "") for k, name in enumerate(names)}
+
+    def place(results):
+        nonlocal text, n
+        for name, ocr in results.items():
+            if ocr.strip():
+                readings[name] = ocr
+            if not insert:
+                if ocr.strip():
+                    why.pop(name, None)
+                else:
+                    why[name] = "no text read"
+                continue
+            text, added = FIG.add_picture_text(text, name, ocr, strict=name in skip)   # text-heavy: stricter
+            n += added
+            if added:
+                why.pop(name, None)
+            else:
+                why[name] = (FIG.picture_ocr_check(text, ocr, strict=name in skip)[1] or "no text read") if ocr.strip() else "no text read"
+
+    pages_first = [name for name in todo if "_Diagram_" not in name]
+    try:
+        if pages_first:
+            place(read(pages_first))                  # a scan, a letter, a screenshot: read as a page
+    except Exception as e:
+        log("picture OCR skipped:", repr(e)[:200])
+        return 0, dict(why, **{name: f"OCR failed: {type(e).__name__}" for name in pages_first}), readings
+    again = [name for name in todo if "_Diagram_" in name or why.get(name) == "no text read"]   # diagrams: full-page OCR read
+                                                      # nothing from any of them in the suite runs, so they go straight here
+    if again:
+        try:                                          # a diagram or chart: full-page OCR sees a picture and reads nothing;
+            place(read(again, force_layout_block="Text", ocr_full_page=False))   # read as one block of text, its labels come out
+        except Exception as e:
+            log("picture OCR, second pass skipped:", repr(e)[:200])
+    if n:
+        md.write_text(text, encoding="utf-8")
+    return n, why, readings
+
+
 def cli_options(o, out_dir):
     """job options -> the same keys Marker's CLI hands to ConfigParser"""
     k = {"output_format": o.get("OUTPUT_FORMAT", "markdown"), "output_dir": str(out_dir), "mode": o["MODE"],
@@ -113,11 +198,14 @@ def cli_options(o, out_dir):
                      ("PAGINATE", "paginate_output"), ("KEEP_HEADERS_FOOTERS", "keep_headers_footers")):
         if o.get(opt):
             k[key] = True
-    if o.get("USE_LLM") and R.quality_option(o, "REDO_INLINE_MATH"):      # accurate (or asked for): inline maths rewritten too
+    if o.get("USE_LLM") and R.quality_option(o, "REDO_INLINE_MATH"):      # asked for (--redo-math): inline maths rewritten too
         k["redo_inline_math"] = True
     if o.get("PAGE_RANGE"):
         k["page_range"] = o["PAGE_RANGE"]
-    if o.get("USE_LLM") and R.quality_option(o, "MARKER_LLM"):      # fast quality: Marker's own LLM steps are left out
+    k.update(R.quality_option(o, "MARKER_EXTRA") or {})                  # every mode: Surya re-reads more of the page
+    # Marker's own LLM steps: in no mode (the box's passes replace them), only with --redo-math, which needs them: Marker
+    # rewrites inline maths only inside those steps (without use_llm the option did nothing)
+    if o.get("USE_LLM") and (R.quality_option(o, "MARKER_LLM") or R.quality_option(o, "REDO_INLINE_MATH")):
         k["use_llm"] = True
         if o.get("LLM_URL"):                      # the box's own vision LLM (OpenAI-compatible llama-server), nothing leaves Kaggle
             k.update(llm_service="marker.services.openai.OpenAIService", openai_base_url=o["LLM_URL"], openai_model=o.get("LLM_MODEL") or "local",
@@ -126,6 +214,20 @@ def cli_options(o, out_dir):
         else:
             k["gemini_api_key"] = os.environ.get("GOOGLE_API_KEY", "")
     return k
+
+
+def printed_numbers(document):
+    """{page: the page number printed in its header or footer} (Marker leaves those out of the Markdown): which half of a
+    cut spread comes first"""
+    from marker.schema import BlockTypes
+    types = tuple(getattr(BlockTypes, k) for k in ("PageHeader", "PageFooter") if hasattr(BlockTypes, k))
+    out = {}
+    for page in document.pages:
+        text = "\n".join(b.raw_text(document) or "" for b in page.contained_blocks(document, types))
+        n = SP.page_number(text) if text.strip() else None
+        if n is not None:
+            out[page.page_id] = n
+    return out
 
 
 def short_document(src, max_pages=2):
@@ -176,13 +278,42 @@ def convert(t):
                             renderer=cp.get_renderer(), llm_service=cp.get_llm_service())
         document = conv.build_document(src)                  # = conv(src), keeping the document for the figure re-crop
         conv.page_count = len(document.pages)
+        rescued, detected = None, {}                   # detected: Indra's text lines per scanned page, found once for
+        indra = MODELS.get("indra_model")              # the rescue and reused by the layout listing below
+        if indra is not None and VLM_URL:
+            try:                                          # text the layout left in no block: read and placed too (scans)
+                rescued = FIG.rescue_missed_text(document, MODELS["recognition_model"], indra.engine, seen=detected)
+            except Exception as e:
+                log("missed-text rescue skipped:", repr(e)[:200])
         save_output(conv.resolve_dependencies(conv.renderer)(document), str(out), t["stem"])
         lap("marker")
         extra, md = {"stage_seconds": clock}, out / f"{t['stem']}.md"
+        page_trace, fig_trace, pic_trace = {}, {}, {}     # per page / figure / picture: for tuning by kind of page (report "trace")
+        try:                                              # what the layout model found on each page (the page profile)
+            indra = MODELS.get("indra_model")
+            lo = t["opts"]
+            labeler = (lambda img, boxes: FIG.ask_labels(img, boxes, lo["LLM_URL"], lo.get("LLM_MODEL") or "local")) \
+                if lo.get("USE_LLM") and lo.get("LLM_URL") and (R.quality_option(lo, "LABEL_BLOCKS") or lo.get("SHOW_LAYOUT")) \
+                else None                                 # --labels / --show-layout only: labels never change the Markdown
+            for p, c in FIG.layout_of(document, out if lo.get("SHOW_LAYOUT") else None, lo.get("SPREADS"),
+                                      detect=indra.engine.detect_all if indra is not None else None, detected=detected,
+                                      labeler=labeler, workers=int(lo.get("LLM_CONCURRENCY") or 2)).items():
+                page_trace.setdefault(str(p), {})["layout"] = c
+        except Exception as e:
+            log("layout listing skipped:", repr(e)[:200])
+        if rescued:
+            extra["text_rescued"] = sum(rescued.values())
+            for p, n in rescued.items():
+                page_trace.setdefault(str(p), {})["rescued_lines"] = n
+        lap("layout_listing")
         if md.is_file() and t["opts"].get("OUTPUT_FORMAT", "markdown") == "markdown":
             if t["opts"].get("IMAGES", True) and t["opts"].get("FIGURE_FIX", True):
                 try:
-                    extra["figures"] = FIG.recrop_document(document, src, out, t["stem"])
+                    extra["figures"] = FIG.recrop_document(document, src, out, t["stem"],   # rules/headers cut without a model
+                                                           peel=not R.quality_option(t["opts"], "CORE_CROP")
+                                                           or bool(R.quality_option(t["opts"], "OCR_PICTURES")))
+                    if extra["figures"].get("edges_peeled"):
+                        extra["edges_peeled"] = extra["figures"]["edges_peeled"]   # summed into the report like the others
                 except Exception as e:                        # keep Marker's own crops rather than fail the document
                     extra["figures"] = {"error": f"{type(e).__name__}: {e}"[:300]}
                     log("figure re-crop failed, kept Marker's crops:", extra["figures"]["error"])
@@ -201,11 +332,30 @@ def convert(t):
                     log("drawn formulas skipped:", repr(e)[:200])
                 extra["shrunk_images"] = R.shrink_images(out, int(t["opts"].get("IMAGE_MAX_PX") or R.IMAGE_MAX_PX))
             lap("figures")
+
+            def repair_text():                        # no model: what the PDF's own characters settle
+                if str(src).lower().endswith(".pdf") and not legacy:
+                    try:                              # a few characters an OCR got wrong where the PDF's own text has the line
+                        n = C.repair_from_layer(md, src)
+                        if n:
+                            extra["layer_fixes"] = extra.get("layer_fixes", 0) + n
+                    except Exception as e:
+                        log("text-layer repair skipped:", repr(e)[:200])
+                if str(src).lower().endswith(".pdf"):
+                    try:                              # Indic vowel signs in visual order: fixed from the PDF's own text
+                        n = C.repair_indic(md, src)
+                        if n:
+                            extra["indic_words_fixed"] = extra.get("indic_words_fixed", 0) + n
+                    except Exception as e:
+                        log("Indic repair skipped:", repr(e)[:200])
+            repair_text()                             # before any model pass: no vision-LLM call (or room in its 800-token audit
+                                                      # answer) is spent on what the PDF's own text fixes, and the pages and
+                                                      # sections it settles are skipped by the audit, line pass and enhancement
             o, llm = t["opts"], t["opts"].get("USE_LLM") and t["opts"].get("LLM_URL")
             q = lambda key: R.quality_option(o, key)
             conc, model = int(o.get("LLM_CONCURRENCY") or 2), o.get("LLM_MODEL") or "local"
             R.set_llm_inflight(int(o.get("LLM_INFLIGHT") or 0))  # one worker may fill every LLM slot, never the queue
-            extra["quality"] = str(o.get("QUALITY") or "balanced")
+            extra["quality"] = R.canonical_quality(o.get("QUALITY")) or R.DEFAULT_QUALITY
 
             def describe():
                 try:                                  # the Markdown is written after the page review (they run at the same time)
@@ -223,7 +373,14 @@ def convert(t):
             def review():
                 if not q("PAGE_REVIEW"):              # fast: no rewrite, only the audit (still side by side with the figures)
                     try:
-                        audit_stats.update(R.audit_pages(md, src, o["LLM_URL"], model, conc, use_layer=not legacy, sizes=sizes))
+                        audit_stats.update(R.audit_pages(md, src, o["LLM_URL"], model, conc, use_layer=not legacy, sizes=sizes,
+                                                         inspect=bool(q("INSPECT")), add_figure=add_figure,
+                                                         line_review=int(q("LINE_REVIEW_TOKENS") or 0),
+                                                         ctx=int(o.get("LLM_CTX") or 8192),
+                                                         keep_headers=bool(o.get("KEEP_HEADERS_FOOTERS")),
+                                                         skip_settled=bool(q("REVIEW_SKIP_SETTLED")),
+                                                         enhance=bool(q("ENHANCE")), triage=bool(q("TRIAGE")),
+                                                         decisions=decisions, trace=page_trace))
                     except Exception as e:
                         log("audit skipped:", repr(e)[:300])
                     return None
@@ -234,9 +391,28 @@ def convert(t):
                                           skip_settled=bool(q("REVIEW_SKIP_SETTLED")))
                 except Exception as e:
                     log("page review failed, kept Marker's pages:", repr(e)[:300])
+            def crop_missing(page_id, bbox, k):       # a figure the inspection saw on the page but the Markdown lacks
+                try:
+                    return FIG.crop_missing_figure(src, page_id, bbox, out, k)
+                except Exception as e:
+                    return None, f"crop failed: {type(e).__name__}"
+            add_figure = crop_missing if (q("INSPECT") or q("TRIAGE")) and o.get("IMAGES", True) and str(src).lower().endswith(".pdf") else None
+            decisions = {}                            # standard: {page: its level, and why}
+            describe_later = llm and q("DESCRIBE_FIGURES") and q("OCR_PICTURES")   # after the inspection, with Surya's
+                                                      # readings as hints, so figures it added are described too
+
+            def crop_figures():                       # no descriptions (--no-describe), but the vision LLM checks every crop
+                import re as _re
+                from concurrent.futures import ThreadPoolExecutor as _Pool
+                names = [n for n in dict.fromkeys(_re.findall(r"!\[[^\]]*\]\(([^)\s]+\.(?:jpe?g|png))\)", md.read_text(encoding="utf-8")))
+                         if not _re.search(r"_(Formula|Table)_", n) and (out / n).is_file()]
+                with _Pool(max(1, conc)) as px:
+                    return sum(bool(x) for x in px.map(lambda n: FIG.tighten_figure(out / n, o["LLM_URL"], model), names))
+
             from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(2) as ex:         # both only wait for the LLM: side by side, the LLM's slots stay full
-                fd = ex.submit(describe) if llm and q("DESCRIBE_FIGURES") else None
+            with ThreadPoolExecutor(3) as ex:         # all only wait for the LLM: side by side, the LLM's slots stay full
+                fc = ex.submit(crop_figures) if llm and q("CORE_CROP") and not q("DESCRIBE_FIGURES") else None
+                fd = ex.submit(describe) if llm and q("DESCRIBE_FIGURES") and not describe_later else None
                 fr = ex.submit(review) if llm and (q("PAGE_REVIEW") or audit) else None
                 if fr is not None and fr.result():
                     extra["page_review"] = fr.result()
@@ -245,23 +421,67 @@ def convert(t):
                     if put:
                         put(md)
                     extra["described_figures"] = n_desc
+                if fc is not None:
+                    try:
+                        extra["figures_cropped_by_llm"] = fc.result()
+                    except Exception as e:
+                        log("figure crop check skipped:", repr(e)[:200])
             lap("describe_review_audit")
             if audit:
                 extra["audit"] = R._public(audit_stats)
-            if str(src).lower().endswith(".pdf") and not legacy:
-                try:                                  # a few characters an OCR got wrong where the PDF's own text has the line
-                    n = C.repair_from_layer(md, src)
-                    if n:
-                        extra["layer_fixes"] = n
+            if decisions:                             # standard: the level each page got
+                extra["page_levels"] = {str(p): d["level"] for p, d in sorted(decisions.items())}
+            lines = {k: v for k, v in audit_stats.items() if k.startswith("line review")}
+            if lines and "page_review" not in extra:  # precise's line pass reported like the page review: pages rewritten
+                extra["page_review"] = {"pages": sum(lines.values()), "rewritten": lines.get("line review: rewritten", 0),
+                                        "kept_draft": {k.split("(", 1)[1].rstrip(")"): v for k, v in lines.items() if "kept draft" in k},
+                                        "examples": []}
+            if describe_later and o.get("IMAGES", True):
+                readings = {}
+                try:                                  # Surya reads every picture first (labels, values, a page's text)
+                    _, skipped, readings = ocr_pictures(md, out, o, text_heavy, insert=False)
+                    pic_trace.update({n: {"words": len(r.split())} for n, r in readings.items()})
+                    if skipped:
+                        extra["pictures_skipped"] = skipped
                 except Exception as e:
-                    log("text-layer repair skipped:", repr(e)[:200])
-            if str(src).lower().endswith(".pdf"):
-                try:                                  # Indic vowel signs in visual order: fixed from the PDF's own text
-                    n_fixed = C.repair_indic(md, src)
-                    if n_fixed:
-                        extra["indic_words_fixed"] = n_fixed
+                    log("picture OCR skipped:", repr(e)[:200])
+                lap("picture_ocr")
+                try:                                  # then the vision LLM writes what each figure MEANS, Surya's reading as
+                    extra["described_figures"] = FIG.describe_figures(       # evidence; Mermaid only for a real diagram
+                        md, out, o["LLM_URL"], model, conc, text_heavy=text_heavy, tighten=bool(q("CORE_CROP")),
+                        graph_tries=int(q("GRAPH_TRIES")), graph_checks=int(q("GRAPH_CHECKS")), hints=readings, trace=fig_trace,
+                        pages=None if not q("TRIAGE") else {p for p, d in decisions.items()    # standard: only pages with
+                                                            if not d.get("page") or d["page"].get("diagrams")   # diagrams or charts
+                                                            or d["page"].get("charts")}
+                        if decisions else None)
                 except Exception as e:
-                    log("Indic repair skipped:", repr(e)[:200])
+                    log("figure descriptions failed:", repr(e)[:300])
+                import re
+                text, kept_text, fallback = md.read_text(encoding="utf-8"), 0, 0
+                for name, ocr in readings.items():  # nothing Surya read is lost: a page's text under its description, and
+                    text, added = FIG.append_ocr_text(text, name, ocr)       # Surya's reading where no description came
+                    kept_text += added
+                    if not added and not re.search(r"\(" + re.escape(name) + r"\)\s*\n+> \*\*Figure content", text):
+                        text, added = FIG.add_picture_text(text, name, ocr, strict=name in text_heavy)
+                        fallback += added
+                md.write_text(text, encoding="utf-8")
+                extra["pictures_read"] = len(readings)
+                if kept_text:
+                    extra["picture_text_kept"] = kept_text
+                if fallback:
+                    extra["pictures_ocr_only"] = fallback
+                lap("describe_figures")
+            elif q("OCR_PICTURES") and o.get("IMAGES", True):
+                try:                                  # express: no description, but the text inside pictures, read by Surya
+                    extra["pictures_read"], skipped, readings = ocr_pictures(md, out, o, text_heavy)
+                    pic_trace.update({n: {"words": len(r.split())} for n, r in readings.items()})
+                    if skipped:
+                        extra["pictures_skipped"] = skipped   # {picture: why it got no OCR text}
+                except Exception as e:
+                    log("picture OCR skipped:", repr(e)[:200])
+                lap("picture_ocr")
+            if fr is not None:                        # a model pass rewrote page text: a near-spelling accept() lets through
+                repair_text()                         # ("resistor" -> "resistar") goes back to the PDF's characters
             try:                                      # tables against the page image: columns, pictures in cells
                 for key, n in FIG.fix_tables(md, document, src, out, t["stem"]).items():
                     if n:
@@ -273,9 +493,31 @@ def convert(t):
                 extra["outline_headings"] = R.apply_outline(md, R.outline(src))
             except Exception as e:
                 log("outline headings skipped:", repr(e)[:200])
+            if t["opts"].get("SPREADS"):              # two-page photos the job cut in two: halves in printed order, original pages
+                spread_map = t["opts"]["SPREADS"]
+                try:
+                    numbers = printed_numbers(document)
+                except Exception as e:                # the Markdown's own lines are looked at instead
+                    numbers = {}
+                    log("page headers not read:", repr(e)[:200])
+                try:
+                    text, n = SP.finish(md.read_text(encoding="utf-8"), spread_map, numbers)
+                    md.write_text(text, encoding="utf-8")
+                    if n:
+                        extra["spreads_reordered"] = n
+                    merged = SP.merge_trace(page_trace, spread_map)
+                    page_trace.clear(); page_trace.update(merged)
+                    if extra.get("page_levels"):
+                        extra["page_levels"] = {str(spread_map[int(k)]): v for k, v in reversed(list(extra["page_levels"].items()))}
+                except Exception as e:
+                    log("spread pages left as cut:", repr(e)[:200])
             R.finish_markdown(md, keep_pages=bool(t["opts"].get("PAGINATE")))
         if legacy:
             extra["forced_ocr"] = f"{legacy}: read with OCR"
+        if md.is_file():
+            extra["trace"] = {"chunks": [{"pages": t["opts"].get("PAGE_RANGE") or "all", "worker": WID, "quality": t["opts"].get("QUALITY"),
+                                          "forced_ocr": bool(legacy), "stage_seconds": dict(clock)}],
+                              "pages": page_trace, "figures": fig_trace, "pictures": pic_trace}
         if LLM_REJECTED:
             extra["marker_llm_rejected"] = dict(LLM_REJECTED)
         if md.is_file() and str(src).lower().endswith(".pdf") and not legacy:
@@ -373,19 +615,28 @@ def next_task():
 BASE_RSS = own_rss()                             # this worker with its models loaded and nothing else
 jwrite(POOL / f"alive_{WID}.json", {"pid": os.getpid(), "vlm": bool(VLM_URL)})
 idle_since = time.time()
+
+
+def shrink_if_idle(why):
+    """a worker idle for 20 s that grew past its loaded size gives the RAM back, or restarts to (models reload on start):
+    idle workers kept their last piece's memory, and 6 of them left too little for the next job (box restarted, run2)"""
+    if time.time() - idle_since > 20 and own_rss() > max(1.5 * BASE_RSS, BASE_RSS + 0.7 * 2 ** 30):
+        give_memory_back()
+        if own_rss() > max(1.5 * BASE_RSS, BASE_RSS + 0.7 * 2 ** 30):
+            log(f"{why} at {own_rss() / 2 ** 30:.1f} GB: restarting to give it back")
+            sys.exit(RECYCLED)
+
+
 while not shutting_down():
     solo = False
     if (POOL / "pause").exists():                # RAM is low (pipeline.guard_memory)
         if anything_running() or not take_solo():                  # someone is converting: wait for it to finish and free memory
-            if time.time() - idle_since > 20 and own_rss() > max(1.5 * BASE_RSS, BASE_RSS + 0.7 * 2 ** 30):
-                give_memory_back()               # an idle worker that grew gives it back, or restarts to (models reload on start)
-                if own_rss() > max(1.5 * BASE_RSS, BASE_RSS + 0.7 * 2 ** 30):
-                    log(f"RAM low and idle at {own_rss() / 2 ** 30:.1f} GB: restarting to give it back")
-                    sys.exit(RECYCLED)
+            shrink_if_idle("RAM low and idle")
             time.sleep(1)
             continue
         solo = True                              # nothing runs: this worker may convert one piece
     elif not free_task_waiting():
+        shrink_if_idle("idle")                   # the job is over (or others hold its last pieces): free what this one kept
         time.sleep(0.4)                          # nothing to take: no start slot used up
         continue
     elif anything_running() and not may_start():

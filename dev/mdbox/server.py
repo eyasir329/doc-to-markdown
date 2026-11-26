@@ -50,11 +50,36 @@ app = FastAPI(title="markdown box", docs_url=None, redoc_url=None, openapi_url=N
 
 OPT_TYPES = {"MODE": str, "OUTPUT_FORMAT": str, "FORCE_OCR": bool, "STRIP_EXISTING_OCR": bool, "REDO_INLINE_MATH": bool, "PAGINATE": bool,
              "KEEP_HEADERS_FOOTERS": bool, "IMAGES": bool, "PAGE_RANGE": str, "USE_LLM": bool, "OFFICE": str,
-             "FIGURE_FIX": bool, "DESCRIBE_FIGURES": bool, "PAGE_REVIEW": bool, "QUALITY": str, "AUDIT": bool}
+             "FIGURE_FIX": bool, "DESCRIBE_FIGURES": bool, "PAGE_REVIEW": bool, "QUALITY": str, "AUDIT": bool,
+             "CHUNK_ROUNDS": int, "SPLIT_SPREADS": bool, "SHOW_LAYOUT": bool, "LABEL_BLOCKS": bool}
+
+
+def number(value, what, lo=0):
+    """a whole number from a request (JSON or text) -> int, else 400 (a client error, not a box error)"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{what} must be a whole number")
+    if n < lo:
+        raise HTTPException(400, f"{what} must be at least {lo}")
+    return n
+
+
+async def body_of(request):
+    """the request's JSON object, else 400"""
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "the request body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "the request body must be a JSON object")
+    return body
 
 
 def clean_options(raw):
     out = {}
+    if raw is not None and not isinstance(raw, dict):
+        raise HTTPException(400, "options must be a JSON object")
     for k, v in (raw or {}).items():
         k = k.upper()
         if k not in OPT_TYPES:
@@ -65,6 +90,8 @@ def clean_options(raw):
             raise HTTPException(400, f"option {k} must be true or false")
         if OPT_TYPES[k] is str and not isinstance(v, str):
             raise HTTPException(400, f"option {k} must be a string")
+        if OPT_TYPES[k] is int and (isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 8):
+            raise HTTPException(400, f"option {k} must be a whole number from 1 to 8")
         if k == "MODE" and v not in pipeline.MODES:
             raise HTTPException(400, f"MODE must be one of {list(pipeline.MODES)}")
         if k == "OFFICE" and v not in pipeline.convert.OFFICE_MODES:
@@ -73,6 +100,12 @@ def clean_options(raw):
             raise HTTPException(400, "OUTPUT_FORMAT must be markdown, html, json or chunks")
         if k == "PAGE_RANGE" and not re.fullmatch(r"[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*", v.replace(" ", "")):
             raise HTTPException(400, "PAGE_RANGE looks like 0,5-10,20 (page numbers start at 0)")
+        if k == "QUALITY":                                 # an old name (superfast, balanced, ...) becomes the current one
+            q = pipeline.R.canonical_quality(v)
+            if q is None:
+                raise HTTPException(400, f"QUALITY must be one of {list(pipeline.R.QUALITIES)} (old names: "
+                                         f"{sorted(pipeline.R.QUALITY_ALIASES)})")
+            v = q
         if k == "USE_LLM" and v and not HAS_LLM:
             raise HTTPException(400, "USE_LLM needs a local LLM on this box (LLM_LOCAL in the notebook) or the Kaggle secret GOOGLE_API_KEY")
         out[k] = v.replace(" ", "") if k == "PAGE_RANGE" else v
@@ -135,15 +168,19 @@ def idle_seconds():
     return round(time.time() - LAST_ACTIVITY[0])
 
 
+CODE_ID = hashlib.sha1(b"".join(p.read_bytes() for p in sorted(Path(__file__).parent.glob("*.py")))).hexdigest()[:10]
+
+
 @app.get("/health")
 async def health():
     now = time.time()
-    return {"ok": True, "box": "markdown", "gpus": gpus(), "uptime_s": round(now - STARTED), "remaining_s": round(DEADLINE - now),
+    return {"ok": True, "box": "markdown", "code": CODE_ID, "gpus": gpus(), "uptime_s": round(now - STARTED), "remaining_s": round(DEADLINE - now),
             "workers": pipeline.POOL.status(), "chunk_pages": int(pipeline.DEFAULTS["CHUNK_MAX_PAGES"]), "vlm": pipeline.POOL.vlm_ok, "vlm_slots": int(pipeline.DEFAULTS["VLM_SLOTS"]),
             "waiting_tasks": pipeline.POOL.waiting() + sum(1 for j in JOBS.values() if j["status"] == "queued" or j.get("stage") == "preparing"), "default_mode": "balanced" if pipeline.POOL.vlm_ok else "fast",
             "llm": HAS_LLM, "llm_model": pipeline.DEFAULTS["LLM_MODEL"] or ("gemini" if HAS_GEMINI else ""),
             "llm_local": bool(LLM_BASE), "llm_slots": int(pipeline.DEFAULTS["LLM_SLOTS"]), "llm_default": bool(pipeline.DEFAULTS["USE_LLM"]),
             "defaults": {k: pipeline.DEFAULTS[k] for k in ("REDO_INLINE_MATH", "DESCRIBE_FIGURES", "PAGE_REVIEW", "LLM_CTX", "QUALITY")},
+            "qualities": list(pipeline.R.QUALITIES),
             "memory": mem_status(), "libreoffice": bool(pipeline.convert.SOFFICE), "ddjvu": bool(pipeline.convert.DDJVU), "idle_s": idle_seconds(), "queued": sum(1 for j in JOBS.values() if j["status"] == "queued"),
             "running": [j["id"] for j in JOBS.values() if j["status"] == "running"], "max_upload_gb": MAX_UPLOAD / 2 ** 30,
             "extensions": list(pipeline.DOC_EXT) + [".zip"]}
@@ -156,10 +193,10 @@ async def list_jobs():
 
 @app.post("/jobs")
 async def create_job(request: Request):
-    body = await request.json()
+    body = await body_of(request)
     if body.get("file_id"):
         return await job_from_file(body)
-    name, size = Path(str(body.get("name") or "document.pdf")).name, int(body.get("size") or 0)
+    name, size = Path(str(body.get("name") or "document.pdf")).name, number(body.get("size") or 0, "size")
     if size <= 0 or size > MAX_UPLOAD:
         raise HTTPException(413, f"size must be 1..{MAX_UPLOAD} bytes")
     if not name.lower().endswith(pipeline.DOC_EXT + (".zip",)):
@@ -234,15 +271,15 @@ def get_file(fid):
 
 @app.post("/files")
 async def create_file(request: Request):
-    body = await request.json()
-    name, size = Path(str(body.get("name") or "document.pdf")).name, int(body.get("size") or 0)
+    body = await body_of(request)
+    name, size = Path(str(body.get("name") or "document.pdf")).name, number(body.get("size") or 0, "size")
     if size <= 0 or size > MAX_UPLOAD:
         raise HTTPException(413, f"size must be 1..{MAX_UPLOAD} bytes")
     if not name.lower().endswith(pipeline.DOC_EXT):
         raise HTTPException(415, f"unsupported file type {Path(name).suffix!r}; supported: {', '.join(pipeline.DOC_EXT)}")
     fid = uuid.uuid4().hex[:12]
     d = UPLOADS / f"file_{fid}"; d.mkdir(parents=True)
-    FILES[fid] = {"id": fid, "name": name, "size": size, "dir": str(d), "status": "uploading"}
+    FILES[fid] = {"id": fid, "name": name, "size": size, "dir": str(d), "status": "uploading", "seen": time.time()}
     LAST_ACTIVITY[0] = time.time()
     return {"file_id": fid, "part_size": PART_SIZE}
 
@@ -252,6 +289,7 @@ async def put_file_part(fid: str, n: int, request: Request):
     f = get_file(fid)
     if f["status"] != "uploading":
         raise HTTPException(409, f"file is {f['status']}")
+    f["seen"] = time.time()
     return await save_part(f["dir"], n, request, f["size"])
 
 
@@ -275,9 +313,16 @@ async def finish(fid: str, request: Request):
     f = get_file(fid)
     if f["status"] != "uploading":
         raise HTTPException(409, f"file is {f['status']}")
-    body = await request.json()
+    body = await body_of(request)
     office = clean_options({"OFFICE": (body.get("options") or {}).get("OFFICE")}).get("OFFICE") or pipeline.DEFAULTS["OFFICE"]
-    res = await asyncio.get_running_loop().run_in_executor(None, finish_file, f, int(body["parts"]), office)
+    n = number(body.get("parts"), "parts", 1)
+    f.update(status="rendering", seen=time.time())          # office/DjVu -> PDF can take long: never expired meanwhile
+    try:
+        res = await asyncio.get_running_loop().run_in_executor(None, finish_file, f, n, office)
+    finally:
+        f["seen"] = time.time()
+        if f["status"] == "rendering":                      # failed: the client may send the missing parts again
+            f["status"] = "uploading"
     if res.get("error"):
         raise HTTPException(409, res["error"])
     LAST_ACTIVITY[0] = time.time()
@@ -296,6 +341,7 @@ async def job_from_file(body):
     f = get_file(str(body["file_id"]))
     if f["status"] != "ready":
         raise HTTPException(409, f"file is {f['status']}")
+    f["seen"] = time.time()
     name = Path(str(body.get("name") or Path(f["path"]).name)).name
     if f["pdf"] and not name.lower().endswith(".pdf"):
         name = Path(name).stem + ".pdf"                                   # it was rendered to PDF on upload
@@ -319,7 +365,7 @@ async def start_job(jid: str, request: Request):
     j = get_job(jid)
     if j["status"] != "uploading":
         raise HTTPException(409, f"job is {j['status']}")
-    n = int((await request.json())["parts"])
+    n = number((await body_of(request)).get("parts"), "parts", 1)
     missing, size = await asyncio.get_running_loop().run_in_executor(None, assemble, j, n)
     if missing:
         raise HTTPException(409, f"missing parts: {missing[:20]}")
@@ -382,7 +428,7 @@ async def delete_job(jid: str):
 async def steal(jid: str, request: Request):
     j = get_job(jid)
     j["seen"] = time.time()
-    n = int((await request.json()).get("n") or 1)
+    n = number((await body_of(request)).get("n") or 1, "n")
     if j["status"] != "running" or n < 1:
         return {"chunks": []}
     return {"chunks": pipeline.steal(jid, min(n, 16))}
@@ -447,6 +493,32 @@ def runner():
             shutil.rmtree(j["updir"], ignore_errors=True)
 
 
+def expire_abandoned():
+    """uploads no client has touched for ABANDON_S (its client was stopped mid-upload, or a POST /jobs retried after a lost
+    answer left a twin): cancelled and deleted. An "uploading" job counts as activity, so one of them kept the box from ever
+    being idle and the notebook never stopped it (GPU quota). Stored files no job uses any more go the same way (disk)"""
+    if ABANDON_S <= 0:
+        return
+    for j in list(JOBS.values()):
+        if j["status"] == "uploading" and abandoned(j):
+            j.update(status="cancelled", stage="cancelled", msg="cancelled: the upload was abandoned", finished=time.time())
+            shutil.rmtree(j["updir"], ignore_errors=True)
+    used = {j.get("file_id") for j in JOBS.values() if j["status"] in ("queued", "running")}
+    for fid, f in list(FILES.items()):
+        if fid not in used and f["status"] != "rendering" and time.time() - f.get("seen", 0) > ABANDON_S:
+            shutil.rmtree(f["dir"], ignore_errors=True)
+            FILES.pop(fid, None)
+
+
+def janitor():
+    while True:
+        time.sleep(30)
+        try:
+            expire_abandoned()
+        except Exception:
+            traceback.print_exc()
+
+
 def memory_watch():
     """runs all the time, not only while a job polls: RAM can fill between two progress ticks"""
     while True:
@@ -460,5 +532,6 @@ def memory_watch():
 
 pipeline.start_pool()
 threading.Thread(target=memory_watch, daemon=True).start()
+threading.Thread(target=janitor, daemon=True).start()
 for _ in range(RUNNERS):
     threading.Thread(target=runner, daemon=True).start()

@@ -13,9 +13,10 @@ It includes no third-party code or model weights. At run time, the Kaggle notebo
 downloads and uses the following components, each under its own license:
 
 - Marker (https://github.com/datalab-to/marker) - code: Apache License 2.0.
-  Its model weights (Surya, layout) use a modified AI Pubs Open RAIL-M license: free for
-  research, personal use and startups under the funding/revenue limit stated by Datalab;
-  larger commercial use needs a licence from Datalab (https://www.datalab.to/pricing).
+  Its model weights (Surya, and the Indra layout, OCR and orientation models) use a
+  modified AI Pubs Open RAIL-M license: free for research, personal use and startups under
+  the funding/revenue limit stated by Datalab; larger commercial use needs a licence from
+  Datalab (https://www.datalab.to/pricing).
 - Surya 2.5 GGUF model (via Marker/Datalab) - as above.
 - Qwen3-VL-8B-Instruct (https://huggingface.co/Qwen) - Apache License 2.0; the GGUF
   quantisation used is published by Unsloth (https://huggingface.co/unsloth).

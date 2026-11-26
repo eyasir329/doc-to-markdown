@@ -28,7 +28,8 @@ def network_up():
 PUBLIC_URL = network_up()
 h = api_get("/health")
 print("\n================ BOX READY ================")
-print("  box   :", BOX_NAME, "| default mode:", h["default_mode"], "| LLM passes:", h["llm_model"] or ("Gemini" if h["llm"] else "off"))
+print("  box   :", BOX_NAME, "| default quality:", (h.get("defaults") or {}).get("QUALITY"), "| Marker reading mode:", h["default_mode"],
+      "| vision LLM:", h["llm_model"] or ("Gemini" if h["llm"] else "off"))
 print("  url   :", PUBLIC_URL)
 print("  PC    : python md_client.py book.pdf          (add --local auto to also convert on your PC's CPUs)")
 print("          (or add  --url", PUBLIC_URL, " if auto-find does not work)")

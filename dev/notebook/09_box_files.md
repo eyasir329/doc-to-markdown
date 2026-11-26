@@ -1,2 +1,2 @@
 ## 5. Box files (these cells only write files)
-`convert.py` routes each file type (LibreOffice first for office files, direct conversion for txt/md/csv); `lb.py` balances VLM requests over the GPU servers; `worker.py` is a warm Marker worker; `pipeline.py` runs one job; `server.py` is the API.
+`convert.py` routes each file type (LibreOffice first for office files, direct conversion for txt/md/csv); `figures.py` re-crops, reads and describes figures and checks tables; `review.py` holds the quality modes and the vision LLM's page passes with their loss checks; `spreads.py` sets scanned pages upright and cuts two-page photos in two; `lb.py` balances requests over the GPU servers; `worker.py` is a warm Marker worker; `pipeline.py` runs one job; `server.py` is the API.

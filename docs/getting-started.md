@@ -72,7 +72,7 @@ When it's ready the log shows a banner like this:
 
 ```
 ================ BOX READY ================
-  box   : markdown | default mode: balanced | LLM passes: qwen3-vl-8b
+  box   : markdown | default quality: standard | Marker reading mode: balanced | vision LLM: qwen3-vl-8b
   url   : https://<random-words>.trycloudflare.com
   PC    : python md_client.py book.pdf          (add --local auto to also convert on your PC's CPUs)
 ===========================================
@@ -115,7 +115,7 @@ preview extension, Obsidian, Typora or GitHub.
 
 Next steps:
 - [Usage](usage.md): folders, batches, page ranges, all options.
-- [Quality modes](quality-modes.md): `--quality fast | balanced | accurate`.
+- [Quality modes](quality-modes.md): `--quality express | standard | precise`.
 
 ## 6. Optional: let your PC help
 
@@ -127,8 +127,8 @@ pip install -r requirements-local.txt
 python md_client.py ./folder --local auto
 ```
 
-`--local auto` (the default once Marker is installed) starts one worker per ~1.5 GB of free RAM, leaving two
-cores free, at most 6. LibreOffice and `ddjvu` on your PC are optional. Files your PC can't convert exactly as
+`--local auto` (the default once Marker is installed) starts one worker per 3.5 GB of free RAM (keeping 3 GB for
+the system), leaving two cores free, at most 6. LibreOffice and `ddjvu` on your PC are optional. Files your PC can't convert exactly as
 the box would always go to the box. For `--describe-again`, keep the `dev/` folder next to `md_client.py` and
 install `numpy`, `pillow` and `scipy`.
 

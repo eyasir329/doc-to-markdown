@@ -1,8 +1,8 @@
-"""converts one document at each quality (fast / balanced / accurate) on the box and prints the trade-off: wall time, worker
+"""converts one document at each quality (express / standard / precise) on the box and prints the trade-off: wall time, worker
 time per stage, LLM work done, text coverage, the box's GPU/CPU/RAM use, and a score when a scorer for that document exists
 (a module `suite_checks.py` next to this file with score(md_path) -> ({case: [(check, ok)]}, extra); optional).
 
-usage: python dev/compare_quality.py DOC.pdf [--out test_out/quality] [--qualities fast balanced accurate]
+usage: python dev/compare_quality.py DOC.pdf [--out test_out/quality] [--qualities express standard precise]
 Each quality goes to its own folder (OUT/<quality>), so a run can be repeated or compared later without converting again
 (an existing finished folder is reused: delete it to convert again)."""
 import argparse
@@ -33,7 +33,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("doc")
     ap.add_argument("--out", default=str(ROOT / "test_out" / "quality"))
-    ap.add_argument("--qualities", nargs="+", default=["fast", "balanced", "accurate"])
+    ap.add_argument("--qualities", nargs="+", default=["express", "standard", "precise"])
     a = ap.parse_args()
     rows = []
     for q in a.qualities:

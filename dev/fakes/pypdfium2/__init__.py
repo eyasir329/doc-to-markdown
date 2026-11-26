@@ -39,6 +39,9 @@ class _TextPage:
     def get_text_range(self):
         return ""
 
+    def count_chars(self):
+        return 0                       # no text layer: a scan, looked at for a two-page spread (blank: none found)
+
     def close(self):
         pass
 

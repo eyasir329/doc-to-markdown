@@ -55,19 +55,24 @@ def bad_args(name):
 print("llama-server:", "help read," if LLAMA_HELP else "no --help output (all flags kept),", f"no-mmap via [{NO_MMAP or 'not available'}]")
 
 SLOTS, VLM_PORTS = {}, []
-def start_vlm(g, slots):
+def start_vlm(g, slots0):
     port = 8081 + g
-    while slots >= 1:
-        ctx = slots * 12288                       # Surya's recommended per-slot context
-        cmd = (f"CUDA_VISIBLE_DEVICES={g} {VLM_ENV} {VLM_BIN} -m {GGUF[0]} --mmproj {GGUF[1]} -ngl 99 {opt(NO_MMAP + ' --threads 1 ' + NO_HOST_CACHE)} "
-               f"--host 127.0.0.1 --port {port} --parallel {slots} --ctx-size {ctx} --alias {VLM_ALIAS} --jinja --special")
-        start(f"vlm{g}", cmd)
-        t0 = time.time()
-        while time.time() - t0 < 600 and alive(f"vlm{g}"):
-            if wait_http(f"http://127.0.0.1:{port}/health", timeout=6, every=3): SLOTS[g] = slots; return port
-        print(f"GPU {g}: server did not come up with {slots} slots:\n" + log_tail(f"vlm{g}", 6))
-        if bad_args(f"vlm{g}"): stop(f"vlm{g}"); return None          # a flag problem: fewer slots will not help
-        stop(f"vlm{g}"); slots //= 2
+    for flags in VLM_FLAG_VARIANTS:               # fastest settings first; plain llama.cpp defaults last
+        slots = slots0
+        while slots >= 1:
+            ctx = slots * 12288                   # Surya's recommended per-slot context
+            cmd = (f"CUDA_VISIBLE_DEVICES={g} {VLM_ENV} {VLM_BIN} -m {GGUF[0]} --mmproj {GGUF[1]} -ngl 99 "
+                   f"{opt(NO_MMAP + ' --threads 1 ' + NO_HOST_CACHE + ' ' + flags)} "
+                   f"--host 127.0.0.1 --port {port} --parallel {slots} --ctx-size {ctx} --alias {VLM_ALIAS} --jinja --special")
+            start(f"vlm{g}", cmd)
+            t0 = time.time()
+            while time.time() - t0 < 600 and alive(f"vlm{g}"):
+                if wait_http(f"http://127.0.0.1:{port}/health", timeout=6, every=3):
+                    SLOTS[g] = slots; print(f"   GPU {g}: Surya with [{flags or 'defaults'}], {slots} slots"); return port
+            print(f"GPU {g}: server did not come up with [{flags or 'defaults'}], {slots} slots:\n" + log_tail(f"vlm{g}", 6))
+            stop(f"vlm{g}")
+            if bad_args(f"vlm{g}"): break             # a flag problem: fewer slots will not help, try the next settings
+            slots //= 2
     return None
 def start_vlms():
     ports, th = {}, []
@@ -100,10 +105,10 @@ if USE_VLM and VLM_BIN and GGUF and gpus:
     for t in th: t.start()
     for t in th: t.join()
     if VLM_PORTS:
-        start("lb", f"{sys.executable} mdbox/lb.py {VLM_LB_PORT} {' '.join(map(str, VLM_PORTS))}")
+        start("lb", f"LB_MAX_INFLIGHT={VLM_LB_MAX_INFLIGHT} {sys.executable} mdbox/lb.py {VLM_LB_PORT} {' '.join(map(str, VLM_PORTS))}")
         if wait_http(f"http://127.0.0.1:{VLM_LB_PORT}/health", timeout=60):
             VLM_URL = f"http://127.0.0.1:{VLM_LB_PORT}/v1"
-    print(f"VLM servers: {len(VLM_PORTS)} GPU(s), slots {SLOTS} in {time.time()-t0:.0f}s" if VLM_URL else "!!! no VLM server is running: CPU-only fast mode")
+    print(f"VLM servers: {len(VLM_PORTS)} GPU(s), slots {SLOTS} in {time.time()-t0:.0f}s" if VLM_URL else "!!! no VLM server is running: CPU-only (Marker's fast reading mode)")
 
 LLM_URL, LLM_SERVERS, LLM_RUN = "", {}, {}      # LLM_RUN[gpu] = (model path, mmproj path, flags, slots) that passed the test
 def llm_ask(port, content, props, max_tokens):

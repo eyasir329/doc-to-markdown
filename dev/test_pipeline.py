@@ -107,6 +107,22 @@ class Resources(unittest.TestCase):
         self.assertEqual(P.format_pages([0, 1, 2, 5, 7, 8]), "0-2,5,7-8")
         self.assertEqual(P.format_pages([4]), "4")
 
+    def test_chunks_balanced_by_work_and_heaviest_first(self):
+        """a scan-heavy stretch gets smaller chunks, chunks stay contiguous and within limits, the heaviest is queued first"""
+        pages = list(range(40)); costs = [1.0] * 30 + [5.0] * 10          # the last 10 pages are full-page scans
+        ch = P.plan_chunks(pages, 4, 2, 24, costs)
+        self.assertEqual(sum(ch, []), pages)                               # every page once, in order
+        self.assertTrue(all(2 <= len(c) <= 24 for c in ch))
+        self.assertLess(len(ch[-1]), len(ch[0]))                           # the scans' chunks are shorter
+        work = [sum(costs[p] for p in c) for c in ch]
+        by_pages = [sum(costs[p] for p in c) for c in P.plan_chunks(pages, 4, 2, 24)]
+        self.assertEqual(max(work), 10.0)                                  # perfectly balanced: 80 work in 8 chunks
+        self.assertEqual(max(by_pages), 25.0)                              # by page count a scan chunk was 2.5x the rest
+        self.assertIsNone(P.split_by_cost(pages, costs, 30, 2, 24))        # 30 chunks of >= 2 pages don't fit 40 pages
+        self.assertEqual(P.heaviest_first([3.0, 9.0, 9.0, 1.0]), [1, 2, 0, 3])
+        self.assertEqual(P.plan_chunks(pages, 4, 4, 24), P.plan_chunks(pages, 4, 4, 24, None))   # no estimate: by pages
+        self.assertIsNone(P.page_costs("/no/such.pdf", [0]))
+
     def test_plan_chunks(self):
         self.assertEqual(len(P.plan_chunks(list(range(15)), 4)), 1)        # short: one piece
         c = P.plan_chunks(list(range(100)), 4)
@@ -274,6 +290,50 @@ class Options(unittest.TestCase):
         with self.assertRaises(self.S.HTTPException):
             self.S.clean_options({"PAGE_RANGE": "1-"})
 
+    def test_quality_and_bad_input_are_client_errors(self):
+        """an old quality name is mapped to the current one; an unknown one, a non-object or a non-number is a 400 (was a 500
+        or, for a quality, a silent fallback with a warning in the report)"""
+        S = self.S
+        self.assertEqual(S.clean_options({"quality": "balanced"}), {"QUALITY": "standard"})
+        self.assertEqual(S.clean_options({"QUALITY": "Precise"}), {"QUALITY": "precise"})
+        for bad in ({"QUALITY": "turbo"}, ["QUALITY"]):
+            with self.assertRaises(S.HTTPException) as e:
+                S.clean_options(bad)
+            self.assertEqual(e.exception.status_code, 400)
+        self.assertEqual(S.number("12", "size"), 12)
+        for bad in ("12x", None, "-1"):
+            with self.assertRaises(S.HTTPException) as e:
+                S.number(bad, "parts", 1)
+            self.assertEqual(e.exception.status_code, 400)
+
+    def test_abandoned_upload_lets_the_box_go_idle(self):
+        """a client stopped mid-upload (or a POST /jobs retried after a lost answer) left a job "uploading" for good: the box
+        never counted as idle and the notebook never stopped it. Stored files no job uses go too; one being rendered stays"""
+        import time
+        S, d = self.S, Path(tempfile.mkdtemp(dir=TMP))
+        saved = dict(S.JOBS), dict(S.FILES), S.LAST_ACTIVITY[0]
+        old = time.time() - 2 * S.ABANDON_S
+        try:
+            S.JOBS.clear(); S.FILES.clear()
+            for k in ("up1", "up2", "up3", "f1", "f2", "f3"):
+                (d / k).mkdir()
+            S.JOBS.update(j1={"id": "j1", "status": "uploading", "created": old, "updir": str(d / "up1")},
+                          j2={"id": "j2", "status": "uploading", "created": time.time(), "updir": str(d / "up2")},
+                          j3={"id": "j3", "status": "running", "created": old, "seen": time.time(), "file_id": "f2", "updir": str(d / "up3")})
+            S.FILES.update(f1={"id": "f1", "status": "ready", "seen": old, "dir": str(d / "f1")},
+                           f2={"id": "f2", "status": "ready", "seen": old, "dir": str(d / "f2")},
+                           f3={"id": "f3", "status": "rendering", "seen": old, "dir": str(d / "f3")})
+            S.expire_abandoned()
+            self.assertEqual((S.JOBS["j1"]["status"], (d / "up1").exists()), ("cancelled", False))
+            self.assertEqual(S.JOBS["j2"]["status"], "uploading")                 # still within ABANDON_S
+            self.assertEqual(sorted(S.FILES), ["f2", "f3"])                       # used by a running job / being rendered
+            self.assertFalse((d / "f1").exists())
+            del S.JOBS["j2"], S.JOBS["j3"]
+            S.LAST_ACTIVITY[0] = time.time() - 100
+            self.assertGreaterEqual(S.idle_seconds(), 100)                        # nothing left that counts as activity
+        finally:
+            S.JOBS.clear(); S.JOBS.update(saved[0]); S.FILES.clear(); S.FILES.update(saved[1]); S.LAST_ACTIVITY[0] = saved[2]
+
 
 class MemoryGuard(unittest.TestCase):
     """the Kaggle session restarted when RAM filled up during Make Electronics with the LLM passes"""
@@ -357,6 +417,82 @@ class MemoryGuard(unittest.TestCase):
             self.assertEqual(pool.requeued.get("00000001", 0), 0)
         finally:
             P.memory = old; server.kill(); worker.kill()
+
+    def test_full_ram_restarts_a_grown_idle_worker_before_a_busy_one(self):
+        """benchmark run2: idle workers kept their last piece's memory and the box restarted (out of RAM) with one piece running"""
+        import subprocess, time
+        pool = P.Pool(Path(tempfile.mkdtemp(dir=TMP)))
+        for d in ("tasks", "results", "running", "logs", "cancel"):
+            (pool.dir / d).mkdir(parents=True)
+        busy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        idle = subprocess.Popen([sys.executable, "-c", "import time; x = bytearray(200 << 20); time.sleep(60)"])
+        pool.procs = {"w0": busy, "w1": idle}
+        P.jwrite(pool.dir / "tasks" / "00000001.json", {"tid": "00000001", "job": "j", "doc": 0, "rel": "book.pdf p1"})
+        (pool.dir / "tasks" / "00000001.claim").write_text("w0")
+        P.jwrite(pool.dir / "running" / "00000001.json", {"wid": "w0", "t0": 0, "name": "book.pdf"})
+        t0 = time.time()
+        while time.time() - t0 < 20 and P.rss(idle.pid) < 190 << 20:
+            time.sleep(0.1)
+        old, G = P.memory, 2 ** 30
+        try:
+            P.memory = lambda: (30 * G, 29 * G)
+            pool.guard_memory(dict(P.DEFAULTS, MEM_PER_WORKER_GB=0.1))
+            idle.wait(5)
+            self.assertIsNotNone(idle.poll()); self.assertIsNone(busy.poll())   # the idle one went, the piece kept running
+            self.assertIn("w1", pool.planned)
+            self.assertTrue((pool.dir / "tasks" / "00000001.claim").exists())
+            self.assertIn("idle worker w1", pool.mem_events[-1])
+        finally:
+            P.memory = old; busy.kill(); idle.kill()
+
+    def test_cancels_and_crashes_never_use_up_the_box(self):
+        """a worker stopped for a cancel or a timeout is no crash; crashes are counted per CRASH_WINDOW_S. It was a budget for
+        the box's whole life: after 3n+3 cancels or damaged files every later job failed with "workers keep crashing\""""
+        import subprocess, time
+        pool = P.Pool(Path(tempfile.mkdtemp(dir=TMP)))
+        for d in ("tasks", "results", "running", "logs", "cancel"):
+            (pool.dir / d).mkdir(parents=True)
+        launched = []
+
+        def launch(wid):
+            launched.append(wid)
+            pool.procs[wid] = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        pool.launch, pool.crash_budget = launch, 2
+        old, G = P.memory, 2 ** 30
+        P.memory = lambda: (30 * G, 5 * G)                                    # plenty of RAM: the guard stays out of it
+        try:
+            launch("w0"); launched.clear()
+            P.jwrite(pool.dir / "tasks" / "00000001.json", {"tid": "00000001", "job": "j", "doc": 0, "rel": "a.pdf"})
+            P.jwrite(pool.dir / "running" / "00000001.json", {"wid": "w0", "t0": time.time(), "name": "a.pdf"})
+            pool.cancel_job("j")
+            pool.maintain(600)
+            self.assertEqual((launched, pool.crashes), (["w0"], []))           # stopped and relaunched: no crash counted
+            self.assertEqual(pool.result("00000001")["error"], "cancelled")
+            for _ in range(3):                                                 # real crashes
+                pool.procs["w0"].kill(); pool.procs["w0"].wait()
+                pool.maintain(600)
+            self.assertEqual((len(pool.crashes), pool.parked, pool.broken), (2, {"w0"}, True))   # a crash loop: parked
+            pool.maintain(600)
+            self.assertEqual(len(pool.crashes), 2)                             # a parked worker is not counted again
+            pool.crashes = [t - P.CRASH_WINDOW_S - 1 for t in pool.crashes]   # ten minutes later
+            pool.maintain(600)
+            self.assertEqual((pool.parked, pool.broken), (set(), False))
+            self.assertIsNone(pool.procs["w0"].poll())                         # running again
+        finally:
+            P.memory = old
+            for p in pool.procs.values():
+                p.kill()
+
+    def test_finished_job_leaves_no_queue_files(self):
+        """every idle worker scans tasks/ a few times a second: a finished job's files are removed (they piled up all session)"""
+        pool = P.Pool(Path(tempfile.mkdtemp(dir=TMP)))
+        for d in ("tasks", "results", "running", "logs", "cancel"):
+            (pool.dir / d).mkdir(parents=True)
+        for f in ("tasks/00000001.json", "tasks/00000001.claim", "running/00000001.json", "results/00000001.json", "cancel/j",
+                  "tasks/00000002.json"):
+            (pool.dir / f).write_text("{}")
+        pool.forget(["00000001"], "j")
+        self.assertEqual(sorted(str(x.relative_to(pool.dir)) for x in pool.dir.rglob("*") if x.is_file()), ["tasks/00000002.json"])
 
     def test_low_ram_never_deadlocks(self):
         """the Make Electronics run stalled: RAM stayed above the pause line with nothing running, so no worker ever started.
@@ -614,6 +750,52 @@ class NoRepeatedWork(unittest.TestCase):
         self.assertEqual(sorted(calls), ["_page_1_Picture_2.jpeg", "_page_6_Figure_1.jpeg"])   # 2 calls for 3 figures
         out = md.read_text()
         self.assertEqual(out.count("content of _page_1_Picture_2.jpeg"), 2); self.assertNotIn("content of _page_1_Picture_1", out)
+
+    def test_graph_read_only_for_a_flow_diagram(self):
+        """the graph was read for every crop Marker's layout calls a Diagram, before its kind was known: on an EEE book 15 of
+        16 were circuits and their 2-3 graph answers + 2 checks were thrown away. Now only for a figure described as one"""
+        import figures as FIG
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        Image.new("RGB", (600, 400), "blue").save(d / "_page_1_Diagram_1.jpeg")      # a circuit
+        Image.new("RGB", (600, 400), "green").save(d / "_page_2_Diagram_1.jpeg")     # a flowchart
+        Image.new("RGB", (600, 400), "red").save(d / "_page_3_Diagram_1.jpeg")       # a 3D shape the describer calls a diagram
+        md = d / "doc.md"
+        md.write_text("![](_page_1_Diagram_1.jpeg)\n\ntext\n\n![](_page_2_Diagram_1.jpeg)\n\nmore text\n\n![](_page_3_Diagram_1.jpeg)\n\nend\n")
+        kinds = {"_page_1_Diagram_1.jpeg": "schematic", "_page_2_Diagram_1.jpeg": "flowchart", "_page_3_Diagram_1.jpeg": "diagram"}
+        graphs = []
+        old_ask, old_graph = FIG._ask_image, FIG.ask_graph
+        FIG._ask_image = lambda u, m, path, prompt, **k: {"kind": kinds[path.name], "summary": "S.", "details": "D."}
+        FIG.ask_graph = lambda u, m, img, ctx, tries, checks: graphs.append(img) or ("- A → B", "```mermaid\nflowchart TD\n  a --> b\n```")
+        try:
+            self.assertEqual(FIG.describe_figures(md, d, "u", "m", tighten=False, graph_tries=2), 3)
+        finally:
+            FIG._ask_image, FIG.ask_graph = old_ask, old_graph
+        self.assertEqual(graphs, [(d / "_page_2_Diagram_1.jpeg").read_bytes()])     # one graph: the flowchart's
+        self.assertEqual(md.read_text().count("```mermaid"), 1)
+
+    def test_cut_off_figure_answer_asked_again_only_with_more_room(self):
+        """the same request at temperature 0 runs out the same way: after a cut-off the next try gets more room (2000 ->
+        4000); a call that failed (a timeout) is still asked again as it was"""
+        import figures as FIG
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        Image.new("RGB", (600, 400), "blue").save(d / "_page_1_Figure_1.jpeg")
+        md = d / "doc.md"
+        asked, errors = [], []
+
+        def ask(u, m, path, prompt, max_tokens=2000, **k):
+            asked.append(max_tokens)
+            if errors:
+                raise errors.pop(0)
+            return {"kind": "table", "summary": "S.", "details": "D."}
+        old = FIG._ask_image
+        FIG._ask_image = ask
+        try:
+            for error, want in ((FIG.CutOff("cut off"), [2000, 4000]), (TimeoutError("timed out"), [2000, 2000])):
+                md.write_text("![](_page_1_Figure_1.jpeg)\n\ntext\n"); asked.clear(); errors[:] = [error]
+                self.assertEqual(FIG.describe_figures(md, d, "u", "m", tighten=False), 1)
+                self.assertEqual(asked, want)
+        finally:
+            FIG._ask_image = old
 
     def test_logo_named_in_alt_text(self):
         """Case 01: the KEY POINT icon got a whole quote block; a logo is named in its alt text, and not asked again"""
@@ -1209,6 +1391,32 @@ class TestSuiteFindings(unittest.TestCase):
         self.assertEqual(P.start_budget(5.0, 4.0, 2.5), 0)                                 # not enough for one more
         self.assertEqual(P.start_budget(2.0, 4.0, 2.5), 0)
 
+    def test_load_balancer_caps_requests_in_flight(self):
+        """a cap per backend: a request waits while every GPU server is at it, and goes as soon as one frees up"""
+        import asyncio, importlib, sys as _sys
+        old = _sys.argv
+        _sys.argv = ["lb.py", "9999", "8181", "8182"]
+        try:
+            lb = importlib.reload(importlib.import_module("lb"))
+        finally:
+            _sys.argv = old
+        a, b = lb.BACKENDS
+        lb.CAP["max_inflight"] = 2
+        lb.inflight[a], lb.inflight[b] = 2, 1
+        self.assertEqual(asyncio.run(lb.pick(None)), [b])                  # only the one below the cap
+        lb.inflight[b] = 2
+        async def scenario():
+            task = asyncio.create_task(lb.pick(None))
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())                                  # both full: it waits
+            lb.inflight[a] = 1
+            return await asyncio.wait_for(task, 1)
+        self.assertEqual(asyncio.run(scenario()), [a])
+        self.assertEqual(lb.stats["waited"], 1)
+        lb.CAP["max_inflight"] = 0                                         # no cap: everything, least busy first
+        self.assertEqual(len(asyncio.run(lb.pick(None))), 2)
+        lb.inflight[a] = lb.inflight[b] = 0
+
     def test_load_balancer_keeps_a_page_on_one_server(self):
         """measured: a page image is 2.8 s of GPU work the first time, 0.06 s when the same server has it; least-busy routing
         reused it for 2 of 48 calls"""
@@ -1231,6 +1439,34 @@ class TestSuiteFindings(unittest.TestCase):
         lb.inflight.update({a: 0, b: 9})
         self.assertEqual(lb.order(key)[0], a)                                  # much busier: spills over to a
         self.assertEqual(lb.order(None)[0], a)                                 # no image: least busy
+
+    def test_load_balancer_skips_a_server_that_is_loading(self):
+        """the memory guard or the watchdog restarted a llama-server: while it loads it answers 503, which went back to the
+        worker and the page lost its vision-LLM pass. Now the other server answers, and the loading one is skipped a while"""
+        import asyncio, importlib, types, sys as _sys
+        old = _sys.argv
+        _sys.argv = ["lb.py", "9999", "8181", "8182"]
+        try:
+            lb = importlib.reload(importlib.import_module("lb"))
+        finally:
+            _sys.argv = old
+        a, b = lb.BACKENDS
+        lb.inflight.update({a: 0, b: 1})                                       # a is the least busy: asked first
+        seen = []
+
+        class Client:
+            async def request(self, method, url, **k):
+                seen.append(url)
+                return types.SimpleNamespace(status_code=503 if url.startswith(a) else 200, content=b"ok", headers={})
+        lb.client = Client()
+
+        class Req:
+            method, headers, query_params = "POST", {}, {}
+            async def body(self): return b'{"messages": []}'
+        r = asyncio.run(lb.proxy("v1/chat/completions", Req()))
+        self.assertEqual((r.status_code, [u.split("/v1")[0] for u in seen]), (200, [a, b]))
+        self.assertGreater(lb.down_until[a], lb.time.time())                  # skipped for a few seconds
+        lb.inflight.update({a: 0, b: 0})
 
     def test_llm_requests_in_flight_are_capped(self):
         import threading, time, urllib.request
@@ -1355,17 +1591,360 @@ class TestSuiteFindings(unittest.TestCase):
             self.assertEqual(sum(ch, []), list(range(n)))                      # every page once, in order
             self.assertTrue(all(len(c) >= 4 for c in ch))
         self.assertEqual([len(c) for c in P.plan_chunks(list(range(27)), 5, 4, 24)], [6, 6, 5, 5, 5])
+        ch = P.plan_chunks(list(range(104)), 6, 4, 24, rounds=4)                    # a job asking for more, smaller chunks
+        self.assertEqual((len(ch), sum(ch, [])), (24, list(range(104))))
+        self.assertEqual(len(P.plan_chunks(list(range(20)), 6, 4, 24, rounds=4)), 5)   # never under min_pages
 
     def test_quality_profiles(self):
-        self.assertFalse(R.quality_option({"QUALITY": "fast"}, "PAGE_REVIEW"))
-        self.assertTrue(R.quality_option({"QUALITY": "fast", "PAGE_REVIEW": True}, "PAGE_REVIEW"))    # set by the job: kept
-        self.assertTrue(R.quality_option({"QUALITY": "accurate"}, "AUDIT"))
-        self.assertFalse(R.quality_option({}, "REDO_INLINE_MATH"))                                    # balanced by default
-        self.assertEqual(R.quality_option({"QUALITY": "accurate"}, "AUDIT_SECTIONS"), (6, 3))         # two audit passes
-        self.assertFalse(R.quality_option({"QUALITY": "fast"}, "MARKER_LLM"))
-        self.assertEqual(R.quality_option({"QUALITY": "nonsense"}, "GRAPH_TRIES"), 2)
-        for q in ("fast", "balanced", "accurate"):
-            self.assertEqual(set(R.QUALITY_PROFILES[q]), set(R.QUALITY_PROFILES["balanced"]))
+        """three modes on one base: express (no vision LLM), standard (the LLM where a page needs it), precise (every pass)"""
+        self.assertEqual(R.QUALITIES, ("express", "standard", "precise"))
+        self.assertTrue(R.quality_option({}, "TRIAGE"))                                               # standard by default
+        self.assertFalse(R.quality_option({"QUALITY": "standard"}, "PAGE_REVIEW"))
+        self.assertTrue(R.quality_option({"QUALITY": "standard", "PAGE_REVIEW": True}, "PAGE_REVIEW"))  # set by the job: kept
+        self.assertEqual(R.quality_option({"QUALITY": "precise"}, "AUDIT_SECTIONS"), (3,))              # one pass, small sections
+        self.assertEqual(R.quality_option({"QUALITY": "nonsense"}, "GRAPH_TRIES"), R.QUALITY_PROFILES["standard"]["GRAPH_TRIES"])
+        for q in R.QUALITIES:
+            self.assertEqual(set(R.QUALITY_PROFILES[q]), set(R.QUALITY_PROFILES["standard"]))
+            for key in ("MARKER_LLM", "REDO_INLINE_MATH", "PAGE_REVIEW", "LABEL_BLOCKS", "TRANSCRIBE_TEXT_IMAGES"):
+                self.assertFalse(R.QUALITY_PROFILES[q][key], (q, key))   # in no mode (labels: the trace only, never the Markdown)
+            self.assertTrue(R.QUALITY_PROFILES[q]["OCR_PICTURES"] and R.QUALITY_PROFILES[q]["REVIEW_SKIP_SETTLED"])
+        ex = {"QUALITY": "express"}                                    # no vision-LLM pass at all
+        for key in ("DESCRIBE_FIGURES", "CORE_CROP", "AUDIT", "INSPECT", "TRIAGE", "ENHANCE", "LINE_REVIEW_TOKENS", "GRAPH_TRIES"):
+            self.assertFalse(R.quality_option(ex, key), key)
+        self.assertTrue(R.quality_option(dict(ex, DESCRIBE_FIGURES=True), "DESCRIBE_FIGURES"))     # a stage set by the job still wins
+        extra = R.quality_option(ex, "MARKER_EXTRA")                   # ... and Surya re-reads more instead
+        self.assertGreater(extra["min_recon_score"], 0.75)
+        self.assertLess(extra["inline_math_min_unicode_frac"], 0.02)
+        st, pr = R.QUALITY_PROFILES["standard"], R.QUALITY_PROFILES["precise"]
+        self.assertTrue(st["TRIAGE"] and st["AUDIT"] and st["DESCRIBE_FIGURES"] and st["CORE_CROP"])
+        self.assertFalse(st["INSPECT"] or st["LINE_REVIEW_TOKENS"] or st["ENHANCE"])   # per page (PAGE_LEVELS); never the line pass
+        self.assertFalse(pr["TRIAGE"])                                                 # precise: every pass on every page
+        self.assertTrue(pr["INSPECT"] and pr["ENHANCE"] and pr["LINE_REVIEW_TOKENS"] > 0)
+        self.assertGreater(pr["GRAPH_TRIES"], st["GRAPH_TRIES"])
+        self.assertEqual(R.PAGE_LEVELS["hard"]["AUDIT_SECTIONS"], pr["AUDIT_SECTIONS"])  # a hard page: precise's finer audit
+
+    def test_quality_names_and_old_names(self):
+        """the five names used before still work, by what they were for (fast = express: the user's choice on 2026-11-26);
+        anything else is unknown (the box answers 400)"""
+        want = {"express": "express", "standard": "standard", "precise": "precise", "superfast": "express", "fast": "express",
+                "balanced": "standard", "auto": "standard", "accurate": "precise", " Precise ": "precise", None: "standard", "": "standard"}
+        for q, c in want.items():
+            self.assertEqual(R.canonical_quality(q), c, q)
+        self.assertIsNone(R.canonical_quality("turbo"))
+        self.assertTrue(R.quality_option({"QUALITY": "accurate"}, "ENHANCE"))         # an old name gets its new mode's steps
+        self.assertFalse(R.quality_option({"QUALITY": "fast"}, "AUDIT"))
+
+    def test_superfast_crop_peels_rules_and_running_headers(self):
+        """superfast has no vision LLM to crop to the figure: a page rule, a running header on its rule and a tab's bar are
+        cut off; a figure's own frame, a chart's axes and a table's rule as wide as the table stay"""
+        import figures as F
+        from PIL import ImageDraw
+        def page(header=True, rule=True, frame=False):
+            im = Image.new("RGB", (1000, 700), "white"); d = ImageDraw.Draw(im)
+            if header:
+                d.rectangle([40, 20, 420, 50], fill="black")                     # "30 Chapter 2 Software processes"
+            if rule:
+                d.rectangle([20, 70, 980, 74], fill=(200, 0, 120))               # the page's rule, wider than the figure
+            d.rectangle([250, 150, 750, 650], outline="black", width=4)          # the figure
+            d.ellipse([400, 300, 600, 500], fill=(60, 60, 200))
+            if frame:
+                d.rectangle([250, 100, 750, 104], fill="black"); d.line([250, 100, 250, 150], fill="black", width=4)
+            return im
+        out, n = F.peel_edges(page())
+        self.assertEqual(n, 2)                                                  # header + rule
+        self.assertLess(out.height, 560); self.assertLess(out.width, 560)       # snapped to the figure
+        self.assertEqual(F.peel_edges(page(header=False))[1], 1)                # a lone rule
+        self.assertEqual(F.peel_edges(page(header=False, rule=False))[1], 0)    # nothing to cut
+        self.assertEqual(F.peel_edges(page(header=False, rule=False, frame=True))[1], 0)   # joined to the figure: kept
+        im = Image.new("RGB", (800, 500), "white"); d = ImageDraw.Draw(im)       # a booktabs table: its rule is its width
+        d.rectangle([100, 50, 700, 54], fill="black")
+        for y in range(90, 450, 60):
+            d.rectangle([100, y, 700, y + 25], fill="black")
+        self.assertEqual(F.peel_edges(im)[1], 0)
+
+    def test_superfast_picture_text_from_ocr(self):
+        """superfast: Surya's reading of a scan or a diagram goes under the picture; noise and repeats don't"""
+        import figures as F
+        md = "Intro text here.\n\n![](_page_3_Picture_1.jpeg)\n\nFigure 3. An old newspaper.\n"
+        ocr = "{0}" + "-" * 48 + "\n\n# THE ADVOCATE\n\nSHIPPING NEWS arrived yesterday from Sydney with cargo and passengers\n"
+        out, added = F.add_picture_text(md, "_page_3_Picture_1.jpeg", ocr)
+        self.assertTrue(added)
+        self.assertIn("![](_page_3_Picture_1.jpeg)\n\n> **Figure content:** read from the image by the OCR model (Surya)", out)
+        self.assertIn("> **THE ADVOCATE**", out)                        # a heading in a picture is not a document heading
+        bold = F.add_picture_text(md, "_page_3_Picture_1.jpeg", "## **Sensor**\n\nName Type Location Area Characteristics Identify Enable Disable")[0]
+        self.assertIn("> **Sensor**", bold); self.assertNotIn("****", bold)          # bold once, not ****Sensor****
+        self.assertNotIn("{0}", out)
+        self.assertEqual(F.add_picture_text(out, "_page_3_Picture_1.jpeg", ocr), (out, False))   # never twice
+        self.assertFalse(F.add_picture_text(md, "_page_3_Picture_1.jpeg", "x 1 2")[1])           # a photo's noise
+        self.assertFalse(F.add_picture_text(md + "\n" + ocr, "_page_3_Picture_1.jpeg", ocr)[1])  # already in the text
+        self.assertFalse(F.add_picture_text(md, "_page_9_Picture_1.jpeg", ocr)[1])               # no such picture
+        page = "zippo[m][n] == *(*(zippo + m) + n) points to zippo addresses"        # Case 12: a label repeated, new numbers
+        grid = " ".join(["zippo zippo+1 zippo [0] [1]"] * 4) + " addresses 0BF2 0BF4 0BF6 0BF8 0BFA 0BFC 0BFE 0C00"
+        self.assertTrue(F.add_picture_text(page + "\n\n![](_page_12_Diagram_71.jpeg)\n", "_page_12_Diagram_71.jpeg", grid)[1])
+        self.assertTrue(F.add_picture_text(page + "\n\n![](_page_12_Diagram_71.jpeg)\n", "_page_12_Diagram_71.jpeg", grid,
+                                           strict=True)[1])         # its labels were dropped with the figure: still new
+        read = F.picture_ocr_quote(page, grid.replace("0BF", "OBF").replace("0C00", "OC00") + " OBOE OAK")
+        self.assertIn("0BF2", read); self.assertIn("0C00", read); self.assertNotIn("OBF2", read)   # hex read with a letter O
+        self.assertIn("OBOE", read); self.assertIn("OAK", read)                                    # words stay
+        shot = "Weka classifier output with weights and the confusion matrix shown below"
+        self.assertFalse(F.add_picture_text(shot + "\n\n![](_page_18_Picture_1.jpeg)\n", "_page_18_Picture_1.jpeg",
+                                            shot + " Wekka confusoin", strict=True)[1])   # a screenshot Marker already read
+        self.assertEqual(F.picture_ocr_check(page, "zippo zippo zippo", strict=True)[1], "only 3 words read")
+        self.assertEqual(F.ocr_pages("\n\n{0}" + "-" * 48 + "\n\nfirst\n\n{1}" + "-" * 48 + "\n\nsecond\n"),
+                         {0: "first", 1: "second\n"})
+
+    def test_page_elements_keep_code_and_formulas_whole(self):
+        page = "# Title\n\nA paragraph.\n\n```c\nint a;\n\nint b;\n```\n\n$$\nx = 1\n\ny = 2\n$$\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+        els = R.page_elements(page)
+        self.assertEqual(len(els), 5)                                     # heading, paragraph, code, formula, table
+        self.assertIn("int b;", els[2]); self.assertIn("y = 2", els[3])
+        self.assertEqual("\n\n".join(els), page)
+
+    def test_inspection_fixes_only_what_loses_nothing(self):
+        """balanced's inspection: a wrong kind or structure is fixed; a fix that loses words, drops maths or code, or names
+        elements that don't exist is refused"""
+        els = ["Section 2 Results", "The loss is L = x^2 + y^2 for every sample.", "int main() { return 0; }",
+               "The value $x_1$ is small."]
+        stats = {}
+        out = R.apply_inspection(list(els), [
+            {"elements": [1], "problem": "heading written as a paragraph", "markdown": "## Section 2 Results"},
+            {"elements": [2], "problem": "maths as text", "markdown": "The loss is $L = x^2 + y^2$ for every sample."},
+            {"elements": [3], "problem": "code not in a block", "markdown": "```c\nint main() { return 0; }\n```"},
+            {"elements": [4], "problem": "maths dropped", "markdown": "The value x1 is small."},
+        ], {}, "", stats)
+        self.assertEqual(out[:3], ["## Section 2 Results", "The loss is $L = x^2 + y^2$ for every sample.",
+                                   "```c\nint main() { return 0; }\n```"])
+        self.assertEqual(out[3], els[3]); self.assertEqual(stats["inspect fixes"], 3)
+        self.assertEqual(stats["inspect refused: would drop maths"], 1)
+        stats = {}
+        out = R.apply_inspection(list(els), [
+            {"elements": [2], "problem": "x", "markdown": "The loss is L for every sample."},          # words lost
+            {"elements": [7], "problem": "x", "markdown": "nothing"},                                  # no such element
+            {"elements": [1, 3], "problem": "x", "markdown": "Section 2 Results int main"},           # not consecutive
+        ], {}, "", stats)
+        self.assertEqual(out, els); self.assertNotIn("inspect fixes", stats)
+        stats = {}
+        out = R.apply_inspection(["**TARGET MD:** a flowchart  \n**CHALLENGE:** arrows", "Use *stick* and `code`."], [
+            {"elements": [1], "problem": "x", "markdown": "TARGET MD: a flowchart\nCHALLENGE: arrows"},          # bold + break lost
+            {"elements": [2], "problem": "x", "markdown": "Use stick and code."}], {}, "", stats)          # italic + code lost
+        self.assertEqual(out, ["**TARGET MD:** a flowchart  \n**CHALLENGE:** arrows", "Use *stick* and `code`."])
+        self.assertEqual(stats["inspect refused: would drop formatting"], 2)
+        out = R.apply_inspection(["A line  \nnext line"], [{"elements": [1], "problem": "x", "markdown": "A line next line"}],
+                                 {}, "", stats)
+        self.assertEqual(out, ["A line  \nnext line"]); self.assertEqual(stats["inspect refused: would drop line breaks"], 1)
+        out = R.apply_inspection(["One half of a", "paragraph split in two."], [
+            {"elements": [1, 2], "problem": "one paragraph split", "markdown": "One half of a paragraph split in two."}], {}, "", {})
+        self.assertEqual(out, ["One half of a paragraph split in two."])     # merged
+
+    def test_inspection_adds_missing_content_with_evidence(self):
+        """balanced: what the page shows but no element has is inserted where it belongs, only with evidence"""
+        layer = "Results\nThe accuracy was 91 percent on the held out test set.\nA footnote about the data source."
+        page_md = "## Results\n\nA footnote about the data source."
+        self.assertEqual(R.missing_text_ok("The accuracy was 91 percent on the held out test set.", page_md, layer, b"", "", ""),
+                         (True, ""))
+        self.assertEqual(R.missing_text_ok("A footnote about the data source.", page_md, layer, b"", "", "")[1],
+                         "already in the page")
+        self.assertEqual(R.missing_text_ok("Our model beats every baseline by far.", page_md, layer, b"", "", "")[1],
+                         "not in the page's text")                          # invented: refused
+        added = []
+        out = R.apply_inspection(["## Results", "A footnote."], [],
+                                 {}, layer, {}, [{"kind": "text", "after": 1, "bbox_2d": [], "markdown": "Missing paragraph."},
+                                                 {"kind": "figure", "after": 0, "bbox_2d": [1, 2, 3, 4], "markdown": ""},
+                                                 {"kind": "text", "after": 9, "bbox_2d": [], "markdown": "bad position"}],
+                                 lambda it: added.append(it["kind"]) or ("![](_page_0_Picture_9500.jpeg)" if it["kind"] == "figure"
+                                                                         else it["markdown"]))
+        self.assertEqual(out, ["![](_page_0_Picture_9500.jpeg)", "## Results", "Missing paragraph.", "A footnote."])
+        self.assertEqual(added, ["text", "figure"])                         # the bad position never reached the checks
+
+    def test_missing_figure_cropped_from_the_page(self):
+        import figures as F
+        from PIL import ImageDraw
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            page = Image.new("RGB", (850, 1100), "white"); dr = ImageDraw.Draw(page)
+            dr.rectangle([100, 500, 500, 800], outline="black", width=6); dr.ellipse([200, 550, 400, 750], fill=(40, 90, 160))
+            page.save(d / "p.pdf", resolution=100)
+            name, why = F.crop_missing_figure(d / "p.pdf", 0, [100, 430, 620, 760], d, 0)
+            self.assertEqual(name, "_page_0_Picture_9500.jpeg", why)
+            with Image.open(d / name) as im:
+                self.assertLess(im.width, 0.6 * 850 * 3)                    # snapped to the drawing, not the whole box
+            self.assertIsNone(F.crop_missing_figure(d / "p.pdf", 0, [100, 430, 620, 760], d, 1)[0])   # already there
+            self.assertEqual(F.crop_missing_figure(d / "p.pdf", 0, [700, 50, 950, 300], d, 2), (None, "no ink there"))
+            (d / F.FIGURE_BOXES).write_text(json.dumps({"_page_0_Figure_3.jpeg": [0, 0.10, 0.45, 0.60, 0.75]}))
+            (d / "_page_0_Picture_9500.jpeg").unlink()
+            self.assertEqual(F.crop_missing_figure(d / "p.pdf", 0, [100, 430, 620, 760], d, 3),
+                             (None, "already there (_page_0_Figure_3.jpeg)"))      # the same figure, framed differently
+            self.assertEqual(F.overlaps_known_figure(d, 0, (0.0, 0.0, 1.0, 1.0)), "_page_0_Figure_3.jpeg")   # a whole-page box
+            self.assertIsNone(F.overlaps_known_figure(d, 1, (0.1, 0.45, 0.6, 0.75)))                      # another page
+            self.assertIsNone(F.overlaps_known_figure(d, 0, (0.1, 0.05, 0.6, 0.3)))                       # elsewhere
+
+    def test_picture_text_kept_under_its_description(self):
+        import figures as F
+        md = "![](_page_23_Figure_4.jpeg)\n\n> **Figure content:** A 1900 newspaper front page.\n\nNext paragraph."
+        news = " ".join(f"word{k}" for k in range(60))
+        out, added = F.append_ocr_text(md, "_page_23_Figure_4.jpeg", news)
+        self.assertTrue(added)
+        self.assertIn("> **Text in the image** (read by the OCR model):", out)
+        self.assertTrue(out.endswith("\n\nNext paragraph."))
+        self.assertFalse(F.append_ocr_text(out, "_page_23_Figure_4.jpeg", news)[1])        # once
+        self.assertFalse(F.append_ocr_text(md, "_page_23_Figure_4.jpeg", "three words only")[1])   # a chart's few labels
+
+    def test_enhancement_keeps_every_fact_and_the_original(self):
+        """accurate's last step: prose written more explicitly, never losing a word, number, formula or format; the author's
+        exact wording follows in a collapsed block"""
+        old = "The (n-1)'s in this formula look like typographic errors, see (8.19) and $s^2$ for details."
+        good = ("The (n-1)'s in this formula look like typographic errors; they are Bessel's correction, see (8.19) and $s^2$ "
+                "for details on why dividing by one less than the sample size gives an unbiased estimate.")
+        self.assertEqual(R.enhanced_ok(old, good), (True, ""))
+        self.assertEqual(R.enhanced_ok(old, good + " So with n = 5 it divides by 4."), (False, "number added"))   # made-up maths
+        self.assertEqual(R.enhanced_ok(old, good.replace("(8.19)", "(8.20)")), (False, "number lost"))
+        self.assertEqual(R.enhanced_ok(old, good.replace("$s^2$", "s^2")), (False, "formatting lost"))   # maths left as text
+        self.assertEqual(R.enhanced_ok(old, "These are Bessel's correction."), (False, "words lost"))
+        self.assertEqual(R.enhanced_ok(old, old), (False, "unchanged"))
+        self.assertEqual(R.enhanced_ok(old, good + " x" * 400)[1], "too long")
+        self.assertTrue(R.prose(old))
+        for el in ("## A heading with several words in it here", "| a | b |", "$$x = 1$$", "- a list item with enough words here",
+                   "<<KEEP 1>>", "```c\nint a;\n```", "Too short."):
+            self.assertFalse(R.prose(el), el)
+        page = "## Variance\n\n" + old + "\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+        orig = R.ask_page
+        R.ask_page = lambda *a, **k: (json.dumps({"paragraphs": [{"paragraph": 1, "text": good}]}), "stop")
+        try:
+            stats = {}
+            out = R.enhance_page(page, b"", "", "", stats)
+        finally:
+            R.ask_page = orig
+        self.assertIn(good + "\n\n<details><summary>Original wording</summary>\n\n" + old + "\n\n</details>", out)
+        self.assertTrue(out.startswith("## Variance") and out.endswith("| 1 | 2 |"))       # heading and table untouched
+        self.assertEqual(stats["paragraphs enhanced"], 1)
+        R.ask_page = lambda *a, **k: (json.dumps({"paragraphs": [{"paragraph": 1, "text": good}]}), "stop")
+        try:                                                              # the page's own text has every word: left alone
+            stats = {}
+            same = R.enhance_page(page, b"", "", "", stats, layer=old + " Variance a b 1 2")
+        finally:
+            R.ask_page = orig
+        self.assertEqual(same, page); self.assertEqual(stats["enhance skipped: confirmed by the page's text"], 1)
+        self.assertTrue(R.needs_enhancing("The varianse is computed over the sampel.",           # OCR slips: rewritten
+                                          {w.lower() for w in R.WORD.findall("The variance is computed over the sample.")}))
+        self.assertTrue(R.needs_enhancing(old, set()))                                           # a scan: the LLM decides
+        two = old + "\n\n" + old.replace("typographic", "printing")
+        for answer in ([{"paragraph": 0, "text": good.replace("typographic", "printing")}],   # 0 was part[-1]: paragraph 2
+                       [{"paragraph": 3, "text": good}]):                                       # got it; no such paragraph
+            R.ask_page = lambda *a, **k: (json.dumps({"paragraphs": answer}), "stop")
+            try:
+                self.assertEqual(R.enhance_page(two, b"", "", "", {}), two, answer)
+            finally:
+                R.ask_page = orig
+        R.ask_page = lambda *a, **k: (json.dumps({"paragraphs": [{"paragraph": 1, "text": good}, {"paragraph": 1, "text": good}]}),
+                                      "stop")
+        try:                                                              # answered twice: rewritten once
+            stats = {}
+            out = R.enhance_page(two, b"", "", "", stats)
+        finally:
+            R.ask_page = orig
+        self.assertEqual((out.count("Original wording"), stats["paragraphs enhanced"]), (1, 1))
+
+    def test_standard_gives_each_page_the_passes_it_needs(self):
+        """standard: the page's own text, else its triage, picks its level; a failed triage gets "inspect" (the safe middle);
+        a hard page never gets precise's line pass or rewrite (auto sent 35 of 104 scan pages there: it cost as much as accurate)"""
+        base = dict(page_type="digital text", maths=False, tables=False, code=False, diagrams=False, charts=False, photos=False,
+                    non_latin=False, clean=True, difficulty=1)
+        layer = ("Plain text of the page in enough words to be a real page of a digital book, with every word of it taken "
+                 "from the PDF's own text layer so nothing about it is uncertain at all.")
+        self.assertEqual(R.page_level(base, layer, layer)[0], "none")                              # its own text settles it
+        self.assertEqual(R.page_level(base, "Plain text, read by OCR.", "")[0], "audit")            # plain text, no layer
+        self.assertEqual(R.page_level(dict(base, tables=True), layer, layer)[0], "inspect")         # structure
+        self.assertEqual(R.page_level(dict(base, page_type="scan", clean=True), "x", "")[0], "inspect")
+        self.assertEqual(R.page_level(dict(base, page_type="handwriting"), "x", "")[0], "hard")     # hard
+        self.assertEqual(R.page_level(dict(base, difficulty=3), "x", "")[0], "hard")             # a hard scan
+        self.assertEqual(R.page_level(dict(base, difficulty=3, tables=True), layer, layer)[0], "inspect")   # digital: its layer
+        self.assertEqual(R.page_level(dict(base, clean=False), "x", "")[0], "hard")                 # noisy and nothing to check
+        self.assertEqual(R.page_level(None, "x", "")[0], "inspect")                                 # the triage failed
+        for level, p in R.PAGE_LEVELS.items():                       # never the line pass or the prose rewrite
+            self.assertEqual(set(p), {"INSPECT", "AUDIT", "AUDIT_SECTIONS"}, level)
+        self.assertFalse(R.PAGE_LEVELS["none"]["AUDIT"] or R.PAGE_LEVELS["none"]["INSPECT"])
+        # a quiet page needs no call at all: every word the PDF's, text blocks only, no picture (layout unknown: triage)
+        self.assertTrue(R.quiet_page(layer, layer, {"Text": 3, "SectionHeader": 1, "_lines": 0, "_labels": {"Text": 3}}))
+        self.assertTrue(R.quiet_page(layer, layer, {"Text": 3, "Picture": 0}))                    # a count of 0 is no block
+        self.assertFalse(R.quiet_page(layer, layer, None))
+        self.assertFalse(R.quiet_page(layer, layer, {"Text": 3, "Equation": 1}))                  # maths may be left as text
+        self.assertFalse(R.quiet_page(layer + "\n\n![](_page_0_Picture_1.jpeg)", layer, {"Text": 3}))   # a picture
+        self.assertFalse(R.quiet_page(layer, "", {"Text": 3}))                                    # a scan: no text to trust
+        self.assertFalse(R.quiet_page("Plain text, read by OCR, with other words.", layer, {"Text": 1}))   # not settled
+        orig = R.ask_page
+        try:                                                              # an answer without the triage's fields: failed
+            R.ask_page = lambda *a, **k: (json.dumps({"kind": "photo"}), "stop")
+            self.assertIsNone(R.triage_page(b"", "", ""))
+            R.ask_page = lambda *a, **k: (json.dumps(base), "stop")
+            self.assertEqual(R.triage_page(b"", "", ""), base)
+        finally:
+            R.ask_page = orig
+
+    def test_each_page_gets_its_levels_passes_once(self):
+        """standard gives a page the passes of its level, never precise's line pass or rewrite; a quiet page gets no triage
+        either. precise: every pass, ONE audit after the line pass, no line pass on a page its own text settles"""
+        md = Path(tempfile.mkdtemp(dir=TMP)) / "doc.md"
+        names = ("page_inputs", "triage_page", "inspect_page", "review_page", "audit_page", "enhance_page", "page_settled")
+        saved, calls, settled = {n: getattr(R, n) for n in names}, [], [False]
+        base = dict(page_type="digital text", maths=False, tables=False, code=False, diagrams=False, charts=False, photos=False,
+                    non_latin=False, clean=True, difficulty=1)
+        tri = [base]
+        try:                                                              # (patched inside the try: a failure can't leak them)
+            R.page_inputs = lambda src, ids: {p: (b"jpeg", "the page text") for p in ids}
+            R.page_settled = lambda text, layer: settled[0]
+            R.triage_page = lambda jpeg, u, m: calls.append("triage") or tri[0]
+            R.inspect_page = lambda text, *a, **k: calls.append("inspect") or text
+            R.review_page = lambda draft, jpeg, layer, u, m, ctx, keep, part: calls.append(("lines", part)) or (draft, None)
+            R.audit_page = lambda text, jpeg, layer, u, m, stats, sizes: calls.append(("audit", tuple(sizes))) or text
+            R.enhance_page = lambda text, *a, **k: calls.append("enhance") or text
+
+            def run(**k):
+                md.write_text("\n\n{0}" + "-" * 48 + "\n\nA page of text.\n"); calls.clear()
+                R.audit_pages(md, "x.pdf", "u", "m", **k)
+                return list(calls)
+            pr = R.QUALITY_PROFILES["precise"]
+            precise = dict(inspect=True, line_review=pr["LINE_REVIEW_TOKENS"], sizes=pr["AUDIT_SECTIONS"],
+                           skip_settled=pr["REVIEW_SKIP_SETTLED"], enhance=pr["ENHANCE"])
+            all_steps = ["inspect", ("lines", 600), ("audit", (3,)), "enhance"]
+            self.assertEqual(run(**precise), all_steps)                                   # one audit pass, after the line pass
+            settled[0] = True
+            self.assertEqual(run(**precise), ["inspect", ("audit", (3,)), "enhance"])     # its own text settles it: no line pass
+            settled[0] = False
+            for over, want in ((dict(page_type="handwriting"), ["triage", "inspect", ("audit", (3,))]),   # hard: a finer audit
+                               (dict(tables=True), ["triage", "inspect", ("audit", (0,))]),               # structure
+                               ({}, ["triage", ("audit", (0,))])):                                        # plain text
+                tri[0] = dict(base, **over)
+                self.assertEqual(run(triage=True, sizes=(0,)), want, over)
+            settled[0], tri[0] = True, base
+            self.assertEqual(run(triage=True), ["triage"])                               # settled after its triage: no pass
+            trace = {"0": {"layout": {"Text": 2, "_lines": 0}}}
+            self.assertEqual(run(triage=True, trace=trace), [])                          # quiet: not even the triage
+            self.assertEqual((trace["0"]["level"], trace["0"]["steps"], trace["0"]["page level: none"]), ("none", [], 1))
+            settled[0], tri[0], trace = False, dict(base, tables=True), {}
+            run(triage=True, trace=trace)                                                 # what each page got, for tuning
+            self.assertEqual((trace["0"]["level"], trace["0"]["steps"], trace["0"]["page level: inspect"]),
+                             ("inspect", ["triage", "inspect", "audit"], 1))
+        finally:
+            for n, f in saved.items():
+                setattr(R, n, f)
+
+    def test_whole_page_audit_sections(self):
+        """fast audits each page in ONE call; only a page too big for the context is split, into as few parts as fit"""
+        paras = ["A paragraph of ordinary text here."] * 20
+        self.assertEqual(len(R.whole_page_sections(paras, "page text")), 1)
+        big = ["word " * 400] * 12                                       # ~8000 tokens of Markdown
+        secs = R.whole_page_sections(big, "")
+        self.assertGreater(len(secs), 1); self.assertLessEqual(len(secs), 4)
+        self.assertEqual("\n\n".join(secs), "\n\n".join(big))         # nothing lost or reordered
+        self.assertTrue(all(R._need(s) <= R.AUDIT_PAGE_TOKENS for s in secs))
+
+    def test_greek_names_in_maths(self):
+        """Case 26: a page that prints "lambda_3" is OCR'd as \\text{lambda}_3; in maths that is the letter, in prose a word"""
+        out = R.tidy("$$T = (\\text{lambda}_1 - \\text{lambda}_2) + \\text{lambda}_3 I_3$$ and $\\text{theta}$ in lambda calculus\n")
+        self.assertIn("\\lambda_3 I_3", out); self.assertIn("$\\theta$", out)
+        self.assertIn("in lambda calculus", out)
+        self.assertIn("\\text{hat}", R.tidy("$y_{\\text{hat}}$\n"))                           # not a Greek letter: kept
+        self.assertIn("$\\lambda x$", R.tidy("$\\text{lambda}x$\n"))                          # not the unknown \\lambdax
 
     def test_planner_leaves_stages_to_the_quality(self):
         import pipeline as P
@@ -1375,6 +1954,18 @@ class TestSuiteFindings(unittest.TestCase):
             plan = P.llm_plan({}, 4, [])
             self.assertNotIn("PAGE_REVIEW", plan); self.assertNotIn("DESCRIBE_FIGURES", plan)
             self.assertFalse(P.llm_plan({"PAGE_REVIEW": False}, 4, [])["PAGE_REVIEW"])
+            warned = []
+            P.llm_plan({"QUALITY": "precise"}, 4, warned)
+            self.assertEqual(warned, [])                                       # the vision LLM runs: nothing to say
+            P.DEFAULTS.update(LLM_URL="", LLM_SLOTS=0)                          # it didn't start (or only Gemini, which no mode uses)
+            for opts, n in (({"QUALITY": "precise"}, 1), ({}, 1), ({"QUALITY": "express"}, 0), ({"QUALITY": "superfast"}, 0),
+                            ({"USE_LLM": False}, 0)):
+                warned = []
+                P.llm_plan(opts, 4, warned)
+                self.assertEqual(len(warned), n, opts)                       # a mode that needs it is not silently express
+            warned = []
+            P.llm_plan({}, 4, warned)
+            self.assertIn("quality standard needs the box's vision LLM", warned[0])   # the box's default quality
         finally:
             P.DEFAULTS.clear(); P.DEFAULTS.update(old)
 
@@ -1490,6 +2081,17 @@ class FigureDescriptions(unittest.TestCase):
         self.assertNotIn("1N4148", out); self.assertEqual(out.count("> **Figure content:**"), 2)
         self.assertIn("> **Figure content:** new _page_316_Picture_9000.jpeg\n>\n> R1 10K to pin 2", out)
 
+    def test_code_cut_into_blocks_is_joined(self):
+        """benchmark p83: '#include ... void main() {' and its body came out as two code blocks with nothing between"""
+        md = "Text.\n\n```c\nvoid main() {\n```\n\n```\n    int i;\n}\n```\n\nAfter.\n"
+        self.assertEqual(R.join_split_code(md), "Text.\n\n```c\nvoid main() {\n    int i;\n}\n```\n\nAfter.\n")
+        kept = ["```c\na();\n```\n\nThen the output:\n\n```\n1\n```\n",          # text between: two blocks
+                "```c\na();\n```\n\n```python\nb()\n```\n",                        # another language
+                "```\na\n```\n\n{4}" + "-" * 48 + "\n\n```\nb\n```\n"]           # the next page
+        for md in kept:
+            self.assertEqual(R.join_split_code(md), md)
+        self.assertIn("void main() {\n    int i;", R.tidy("```c\nvoid main() {\n```\n\n```\n    int i;\n```\n"))
+
     def test_quoted_code_survives_tidy(self):
         md = "![](a.jpeg)\n\n> **Figure content:** A listing.\n>\n> ```c\n> x = $5;\n> ```\n\n> **Figure content:** USB port\n> ```\n"
         self.assertEqual(R.tidy(md), "![](a.jpeg)\n\n> **Figure content:** A listing.\n>\n> ```c\n> x = $5;\n> ```\n\n> **Figure content:** USB port\n")
@@ -1525,6 +2127,555 @@ class BatchOverlap(unittest.TestCase):
         self.assertFalse(finished)
         done((192, 200)); self.assertEqual(finished, [True])                # joined once all are saved
         self.assertTrue(all((run.parts_dir(u, b) / "done.json").is_file() for b in jobs))
+
+
+def _photo(spread=True, title=False, seed=1):
+    """a synthetic photo: paper on a dark table, text as word-like strokes in left-aligned lines with ragged ends (and short
+    paragraph ends); spread = two pages with a wide fold, else one page with a narrow column gap (and a headline across)"""
+    import random
+    from PIL import ImageDraw
+    rnd = random.Random(seed)
+    im = Image.new("L", (1400, 1000), 60)
+    d = ImageDraw.Draw(im)
+    d.rectangle([60, 60, 1340, 940], fill=235)
+    blocks = [(110, 640), (760, 1290)] if spread else [(110, 685), (715, 1290)]
+    top = 200 if title else 120
+    if title:
+        d.rectangle([150, 110, 1250, 150], fill=20)
+    for x0, x1 in blocks:
+        y = top
+        while y < 880:
+            ragged = x1 - rnd.randint(0, 60) if spread else x1           # a book's prose is ragged here; columns are justified
+            end = ragged if rnd.random() > 0.2 else x0 + rnd.randint(150, 400)
+            x = x0
+            while x < end - 20:
+                w = rnd.randint(15, 70)
+                d.rectangle([x, y, min(x + w, end), y + 13], fill=25)
+                x += w + rnd.randint(8, 14)
+            y += 28
+    return im
+
+
+class Spreads(unittest.TestCase):
+    """two facing pages in one photo: cut in two before OCR (subset p84: loops missing, a listing twice, read whole)"""
+
+    def test_a_spread_is_found_and_cut_in_reading_order(self):
+        import spreads as SP
+        info = SP.analyse(_photo())
+        self.assertIsNotNone(info)
+        self.assertAlmostEqual(info["fold"], 700 / 1400, delta=0.03)
+        self.assertEqual((info["first"], info["sure_order"]), ("left", True))     # lines start on the left
+        first, second = SP.cut(_photo().convert("RGB"), info)
+        self.assertLess(first.width, 800); self.assertLess(second.width, 800)    # one page each
+
+    def test_an_upside_down_spread_is_turned_and_its_halves_swapped(self):
+        import spreads as SP
+        info = SP.analyse(_photo().rotate(180))
+        self.assertEqual(info["first"], "right")
+        a, _ = SP.cut(_photo().rotate(180).convert("RGB"), info)
+        first, second = SP.cut(_photo().convert("RGB"), SP.analyse(_photo()))
+        import numpy as np
+        px = lambda x: np.asarray(x.convert("L").resize((200, 300)), dtype=np.int32)
+        diff = lambda x, y: int(np.abs(px(x) - px(y)).sum())
+        self.assertLess(diff(a, first), 0.5 * diff(a, second))                     # upright again, and the first page first
+
+    def test_one_page_with_columns_and_a_headline_is_not_cut(self):
+        import spreads as SP
+        for page in (_photo(spread=False, title=True), _photo(spread=False)):   # a narrow column gap: at most a weak fold,
+            info = SP.analyse(page)                                               # cut only with page numbers on both sides
+            self.assertTrue(info is None or not info["strong"])
+        self.assertIsNone(SP.analyse(Image.new("L", (1000, 700), 230)))            # nothing on it
+
+    def test_halves_stay_in_one_chunk_and_get_the_original_page_back(self):
+        import re
+        import spreads as SP
+        page_map = [0, 1, 1, 2]                                                    # page 1 was a spread
+        self.assertEqual(SP.keep_pairs([[0, 1], [2, 3]], page_map), [[0, 1, 2], [3]])
+        sep = lambda k: "{%d}" % k + "-" * 48
+        md = f"{sep(0)}\n\nA\n\n{sep(1)}\n\nsecond\n\n{sep(2)}\n\nfirst\n\n{sep(3)}\n\nZ\n"
+        out, n = SP.finish(md, page_map, {1: 128, 2: 127})                         # read upside down: 128 before 127
+        self.assertEqual(n, 1)
+        self.assertLess(out.index("first"), out.index("second"))
+        self.assertEqual(re.findall(r"\{(\d+)\}-{48}", out), ["0", "1", "2"])
+        out, n = SP.finish(md, page_map, {1: 127, 2: 128})                         # already in order
+        self.assertEqual(n, 0); self.assertLess(out.index("second"), out.index("first"))
+        self.assertEqual(SP.page_number("text\nCOMPACT IT Written | Page | 127"), 127)
+        self.assertEqual(SP.page_number("Page | xi\nbody"), 11)
+        self.assertIsNone(SP.page_number("1. a list item\n2. another"))
+        tr = SP.merge_trace({"1": {"s": 2.0, "fixes": 1, "steps": ["audit"]}, "2": {"s": 3.0, "fixes": 2, "steps": ["inspect"]}}, page_map)
+        self.assertEqual(tr["1"]["s"], 5.0); self.assertEqual(tr["1"]["fixes"], 3); self.assertEqual(tr["1"]["halves"], 2)
+
+    def test_a_scanned_pdf_with_a_spread_gets_three_pages_and_a_map(self):
+        import spreads as SP
+        try:
+            import pypdfium2  # noqa: F401
+        except ImportError:
+            self.skipTest("pypdfium2 not installed")
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        src = d / "book.pdf"
+        _photo().convert("RGB").save(src, "PDF", save_all=True, append_images=[_photo(spread=False, title=True).convert("RGB")], resolution=100)
+        out, page_map, turned = SP.split_spreads(src, d / "cut.pdf", turn=False)
+        self.assertEqual((page_map, turned), ([0, 0, 1], 0))
+        self.assertEqual(SP.pages_for(page_map, [0]), [0, 1])
+        self.assertEqual(SP.split_spreads(d / "cut.pdf", d / "again.pdf", turn=False), (d / "cut.pdf", None, 0))   # halves are no spreads
+
+
+class SpreadPageNumbers(unittest.TestCase):
+    """a weaker fold (a tightly bound book: subset p83, p85) is a spread only with a printed page number on each side; a
+    single page with an empty band down its middle (handwritten notes, a formula page) has none there"""
+
+    @staticmethod
+    def _engine(texts):
+        """lines: 8 per side (x < 500 left), top to bottom; texts[(side, row)] what Indra reads there"""
+        import numpy as np
+        boxes = np.array([[x, y, x + 300, y + 20, 1.0] for x in (50, 600) for y in range(0, 1200, 150)], dtype=np.float32)
+
+        class E:
+            detect = staticmethod(lambda gray: boxes)
+            recognize = staticmethod(lambda gray, bx: [(texts.get(("L" if b[0] < 500 else "R", int(b[1])), "words"), 0.9, []) for b in bx])
+        return E
+
+    def test_page_numbers_on_both_sides_make_a_spread(self):
+        import numpy as np
+        import spreads as SP
+        gray = np.zeros((1000, 1000), np.uint8)
+        both = {("L", 1050): "Page | 118", ("R", 1050): "Page | 119"}
+        self.assertTrue(SP.numbered_pair(self._engine(both), gray, 0.5))
+        misread = {("L", 1050): "201", ("R", 1050): "Page | 201"}                   # p85: 200 read as 201
+        self.assertTrue(SP.numbered_pair(self._engine(misread), gray, 0.5))
+        self.assertFalse(SP.numbered_pair(self._engine({("R", 1050): "Page | 201"}), gray, 0.5))  # one page number: one page
+        self.assertFalse(SP.numbered_pair(self._engine({("L", 1050): "12", ("R", 1050): "340"}), gray, 0.5))  # far apart
+        self.assertTrue(SP.numbered_pair(self._engine({("L", 0): "Page 7", ("R", 150): "Page 8"}), gray, 0.5))   # headers
+        toc = {("L", 300): "69", ("R", 300): "70", ("L", 600): "71", ("R", 600): "72"}   # middle lines: a contents page
+        self.assertFalse(SP.numbered_pair(self._engine(toc), gray, 0.5))
+
+    def test_a_weak_fold_is_cut_only_with_page_numbers(self):
+        import spreads as SP
+        try:
+            import pypdfium2  # noqa: F401
+        except ImportError:
+            self.skipTest("pypdfium2 not installed")
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        src = d / "book.pdf"
+        _photo().convert("RGB").save(src, "PDF", resolution=100)
+        real = SP.analyse
+        old = (SP.analyse, SP.numbered_pair, SP.page_turn, list(SP._ENGINE))
+        SP.analyse = lambda g: dict(real(g), strong=False) if real(g) else None     # the same fold, but weak
+        SP.page_turn, SP._ENGINE[:] = (lambda eng, gray: 0), ["engine"]
+        try:
+            SP.numbered_pair = lambda eng, gray, fold: False
+            self.assertIsNone(SP.prepare_page(src, 0))                                # no page numbers: left whole
+            SP.numbered_pair = lambda eng, gray, fold: True
+            self.assertTrue(SP.prepare_page(src, 0)["pdf"])                          # page numbers on both sides: cut
+        finally:
+            SP.analyse, SP.numbered_pair, SP.page_turn, SP._ENGINE[:] = old[0], old[1], old[2], old[3]
+        self.assertTrue(SP.analyse(_photo())["strong"])                              # a clear fold needs no page numbers
+
+
+class _FakeIndra:
+    """stand-in for Indra's OrtOCR: orientation probabilities and how sure the recognizer reads the page each way"""
+    orient_min = 0.95
+
+    def __init__(self, probs, conf=None, sideways=0):
+        self.probs, self.conf, self.sideways = probs, conf or {0: 0.9, 2: 0.5}, sideways
+
+    def orientation_probs(self, small):
+        import numpy as np
+        return np.array(self.probs)
+
+    def read_turn(self, gray, a, small, p):
+        return self.sideways
+
+    def _turn(self, gray, k, a, small):
+        return k, k, a                                   # the "image" is the turn, for recognize below
+
+    def detect(self, img):
+        import numpy as np
+        return np.array([[0, 0, 100, 10, 1.0]]) if img in (0, 2) else np.zeros((0, 5))
+
+    def recognize(self, img, boxes):
+        return [("text", self.conf[img], [])]
+
+
+def _fake_indra_module():
+    import types
+    m = types.ModuleType("indra_ocr.pipeline")
+    m.preview, m.estimate_skew, m.rotate_page = (lambda g: g), (lambda g: 0.0), (lambda g, a: g)
+    m.DESKEW_MIN, m.SIDEWAYS_LINES, m.SIDEWAYS_MASS, m.VERTICAL = 0.3, 8, 0.8, 4
+    return m
+
+
+class Orientation(unittest.TestCase):
+    """scans are laid out and read as they stand (Marker runs Indra with turn=False): each is set upright first"""
+
+    def setUp(self):
+        self.old = {k: sys.modules.get(k) for k in ("indra_ocr", "indra_ocr.pipeline")}
+        import types
+        sys.modules["indra_ocr"] = types.ModuleType("indra_ocr")
+        sys.modules["indra_ocr.pipeline"] = _fake_indra_module()
+
+    def tearDown(self):
+        for k, v in self.old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def test_the_turn_follows_indra_and_an_unsure_half_turn_must_read_clearly_better(self):
+        import spreads as SP
+        turn = lambda *a, **k: SP.page_turn(_FakeIndra(*a, **k), "gray")
+        self.assertEqual(turn([0.99, 0, 0.01, 0, 0]), 0)                                   # upright
+        self.assertEqual(turn([0, 0.99, 0, 0.01, 0]), 1)                                   # sideways (p21)
+        self.assertEqual(turn([0, 0, 0, 0.01, 0.99]), 0)                                   # vertical columns: as they are
+        self.assertEqual(turn([0.24, 0, 0.76, 0, 0], {0: 0.433, 2: 0.715}), 2)             # p84: unsure, reads 0.28 better
+        self.assertEqual(turn([0.08, 0.16, 0.73, 0.03, 0], {0: 0.513, 2: 0.582}), 0)       # a Thai sign: only 0.07 better
+        self.assertEqual(turn([0, 0, 0.99, 0, 0], {0: 0.68, 2: 0.98}), 2)                  # p11: sure, and reads better
+        self.assertEqual(turn([0.1, 0.45, 0, 0.45, 0], sideways=3), 3)                     # unsure sideways: Indra reads it
+        self.assertEqual(turn([0.5, 0, 0.1, 0, 0.4]), 0)                                   # unsure, no side: as it is
+
+    def test_a_turned_scan_keeps_its_image_and_gets_the_pdf_rotation(self):
+        import spreads as SP
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            self.skipTest("pypdfium2 not installed")
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        src = d / "scan.pdf"
+        page = Image.new("RGB", (600, 800), "white")
+        page.save(src, "PDF", save_all=True, append_images=[page.copy()], resolution=100)
+        calls = []
+
+        def fake_turn(eng, gray):
+            calls.append(gray.shape); return 2 if len(calls) == 2 else 0     # the second page is upside down
+        old_turn, old_engine = SP.page_turn, list(SP._ENGINE)
+        SP.page_turn, SP._ENGINE[:] = fake_turn, ["engine"]
+        try:
+            out, page_map, turned = SP.split_spreads(src, d / "up.pdf")
+        finally:
+            SP.page_turn, SP._ENGINE[:] = old_turn, old_engine
+        self.assertEqual((page_map, turned), ([0, 1], 1))
+        pdf = pdfium.PdfDocument(str(out))
+        self.assertEqual([pdf[i].get_rotation() for i in range(2)], [0, 180])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(SP.split_spreads(src, d / "none.pdf", turn=False), (src, None, 0))  # nothing to do: the file as it is
+
+
+class LayoutListing(unittest.TestCase):
+    def test_every_block_is_counted_drawn_and_listed_per_page(self):
+        """--show-layout: what the layout model found on each page, before any mode's work (and the counts in the trace).
+        A list's items sit in a ListGroup: listed too. On an OCR page, a text line Indra's detector finds in no block is text
+        the layout did not place (digital pages are left out: Marker places those lines itself)"""
+        import enum, types
+        import numpy as np
+        import figures as F
+        BT = enum.Enum("BlockTypes", "Text SectionHeader Table Picture Equation Code ListGroup ListItem Line Span Page")
+        fake = types.ModuleType("marker.schema"); fake.BlockTypes = BT
+        box = lambda *b: types.SimpleNamespace(bbox=list(b))
+        blk = lambda t, bb, k=None: types.SimpleNamespace(block_type=t, polygon=box(*bb), top_k=k)
+        blocks = [blk(BT.SectionHeader, (10, 10, 300, 40), {BT.SectionHeader: 0.97, BT.Text: 0.02}),
+                  blk(BT.Text, (10, 50, 300, 200), {BT.Text: 0.91}), blk(BT.Table, (10, 210, 300, 400)),
+                  blk(BT.Code, (310, 10, 590, 300), {BT.Code: 0.88}),
+                  blk(BT.ListGroup, (310, 420, 590, 600)), blk(BT.ListItem, (315, 425, 585, 450), {BT.ListItem: 0.8})]
+        detected = (np.array([[40, 120, 580, 150, 0.9],                  # in the Text block (pixels: the image is 2x the page)
+                              [40, 1400, 580, 1430, 0.9],                # in no block: missed
+                              [700, 1300, 900, 1320, 0.9]]),             # inside a picture the detector found: the picture's
+                    np.array([[680, 1250, 1000, 1350]]))
+        asked = []
+
+        class Page:
+            page_id, polygon, text_extraction_method = 3, types.SimpleNamespace(width=600.0, height=800.0), "surya"
+
+            def contained_blocks(self, doc, ts):
+                asked.append(set(ts)); return [b for b in blocks if b.block_type in ts]
+
+            def get_image(self, highres=True):
+                return Image.new("RGB", (1200, 1600), "white")
+        old = sys.modules.get("marker.schema")
+        sys.modules["marker.schema"] = fake
+        try:
+            d = Path(tempfile.mkdtemp(dir=TMP))
+            counts = F.layout_of(types.SimpleNamespace(pages=[Page()]), d, detect=lambda gray: detected)
+            labels = {"SectionHeader": 1, "Text": 1, "Table": 1, "Code": 1, "ListGroup": 1, "ListItem": 1}
+            self.assertEqual(counts, {3: dict(labels, _lines=3, _lines_outside=1, _labels=labels, _disputed=0, _handwritten=0)})
+            self.assertFalse({BT.Line, BT.Span, BT.Page} & asked[0])            # blocks, not their lines
+            listed = json.loads((d / "layout" / "page_4.json").read_text())
+            self.assertEqual([(b["type"], b["score"]) for b in listed["blocks"]][:4],
+                             [("SectionHeader", 0.97), ("Text", 0.91), ("Table", None), ("Code", 0.88)])
+            self.assertEqual(listed["lines_outside"], [[20, 700, 290, 715]])
+            Page.text_extraction_method = "pdftext"                           # digital: Marker places stray lines itself
+            self.assertEqual(F.layout_of(types.SimpleNamespace(pages=[Page()]), detect=lambda gray: detected)[3]["_lines"], 0)
+            Page.text_extraction_method = "surya"
+            with Image.open(d / "layout" / "page_4.png") as im:
+                rgb = im.convert("RGB")
+                self.assertEqual(max(im.size), 1400)
+                k = 1050 / 600
+                self.assertNotEqual(rgb.getpixel((int(10 * k), int(100 * k))), (255, 255, 255))   # a block's edge
+                self.assertEqual(rgb.getpixel((int(20 * k), int(707 * k))), F.MISSED)             # the missed line
+            self.assertEqual(F.layout_of(types.SimpleNamespace(pages=[Page()]), detect=lambda gray: detected), counts)  # counts only
+            again, image = [], Page.get_image                             # the rescue's detections: not detected again, and
+            Page.get_image = lambda self, highres=True: again.append("image")   # no page image fetched for the counts
+            try:
+                self.assertEqual(F.layout_of(types.SimpleNamespace(pages=[Page()]), detect=lambda gray: again.append("detect"),
+                                             detected={3: (*detected, 1200)}), counts)
+            finally:
+                Page.get_image = image
+            self.assertEqual(again, [])
+            kinds = ["title", "handwriting", "table", "code", "list", "photo"]     # the vision LLM, one per block
+            hand = [False, True, False, False, True, False]
+            calls = []
+            lab = F.layout_of(types.SimpleNamespace(pages=[Page()]), d, labeler=lambda img, bx: calls.append(len(bx)) or (kinds, hand), workers=2)
+            self.assertEqual(calls, [6])
+            self.assertEqual(lab[3]["_labels"], {"Title": 1, "Handwriting": 1, "Table": 1, "Code": 1, "ListGroup": 1, "ListItem": 1})
+            self.assertEqual((lab[3]["_disputed"], lab[3]["_handwritten"]), (1, 2))  # a list item called a photo; 2 handwritten
+            listed = json.loads((d / "layout" / "page_4.json").read_text())["blocks"]
+            self.assertEqual([(b["type"], b["qwen"], b["label"]) for b in listed][:2], [("SectionHeader", "title", "Title"), ("Text", "handwriting", "Handwriting")])
+            self.assertEqual(len(list((d / "layout").iterdir())), 2)
+            spread = Path(tempfile.mkdtemp(dir=TMP))
+            F.layout_of(types.SimpleNamespace(pages=[Page()]), spread, page_map=[0, 1, 2, 2, 3])
+            self.assertTrue((spread / "layout" / "page_3b.png").is_file())           # a spread's second half, page 3 as counted
+        finally:
+            if old is None:
+                sys.modules.pop("marker.schema", None)
+            else:
+                sys.modules["marker.schema"] = old
+
+    def test_a_chunks_layout_pages_move_to_the_document(self):
+        d = Path(tempfile.mkdtemp(dir=TMP)); chunk, doc = d / "c0", d / "doc"
+        (chunk / "layout").mkdir(parents=True); doc.mkdir()
+        (chunk / "book.md").write_text("text"); (chunk / "layout" / "page_4.png").write_bytes(b"x")
+        self.assertEqual(C._take_chunk(chunk, doc, "book", {}), "text")
+        self.assertTrue((doc / "layout" / "page_4.png").is_file())
+
+
+class BlockLabels(unittest.TestCase):
+    """every block labelled: the layout model has no class for handwriting, code it reads as text, a title, a page number,
+    a chart or a photo (subset: 0 Handwriting blocks on 17 handwritten pages, 4 Code blocks for 70 listings). The OCR's own
+    output and the vision LLM refine the type; the block's text is never changed"""
+
+    def test_the_ocr_output_says_what_a_text_block_is(self):
+        import figures as F
+        self.assertEqual(F.ocr_label("Text", "<pre><code>int main() {\n return 0;\n}</code></pre>"), "Code")
+        self.assertEqual(F.ocr_label("Text", "<p>See:</p><table><tr><td>1</td></tr></table>"), "Table")
+        self.assertEqual(F.ocr_label("Text", "<p>where <math>x^2</math> is the area</p>"), "TextInlineMath")
+        self.assertIsNone(F.ocr_label("Text", "<p>plain words only</p>"))
+        self.assertIsNone(F.ocr_label("Text", "<p>the <code>printf</code> call prints the text in a long sentence</p>"))  # a word
+        self.assertIsNone(F.ocr_label("Picture", "<pre>x</pre>"))                    # not a text block
+        self.assertIsNone(F.ocr_label("Text", None))
+
+    def test_the_vision_llm_refines_and_a_disagreement_keeps_the_layout_type(self):
+        import figures as F
+        self.assertEqual(F.fuse_label("Text", "handwriting"), ("Handwriting", False))
+        self.assertEqual(F.fuse_label("Text", "code"), ("Code", False))
+        self.assertEqual(F.fuse_label("SectionHeader", "title"), ("Title", False))
+        self.assertEqual(F.fuse_label("PageFooter", "page_number"), ("PageNumber", False))
+        self.assertEqual(F.fuse_label("Picture", "chart"), ("Chart", False))
+        self.assertEqual(F.fuse_label("Diagram", "photo"), ("Photo", False))
+        self.assertEqual(F.fuse_label("Text", "text"), ("Text", False))              # the same class
+        self.assertEqual(F.fuse_label("Picture", "figure"), ("Picture", False))
+        self.assertEqual(F.fuse_label("Text", "photo"), ("Text", True))              # text called a photo: disputed
+        self.assertEqual(F.fuse_label("Table", "handwriting"), ("Table", True))
+        self.assertEqual(F.fuse_label("Text", "text", "Code"), ("Code", False))      # the OCR wrote a listing
+        self.assertEqual(F.fuse_label("Text", "handwriting", "Code"), ("Handwriting", False))
+        self.assertEqual(F.fuse_label("Text", None, "Code"), ("Code", False))        # no vision LLM (superfast)
+        self.assertEqual(F.fuse_label("TableGroup", "photo"), ("TableGroup", False)) # a group: its parts are labelled
+        self.assertEqual(F.fuse_label("Text", "other"), ("Text", False))
+
+    def test_each_numbered_box_gets_the_llm_label(self):
+        import review as R
+        import figures as F
+        sent = []
+        old = R.ask_page
+        answers = iter([('{"kinds": ["title", "equation", "nonsense"], "handwritten": [false, true, "x"]}', "stop"),
+                        ('{"kinds": ["text"], "handwritten": [true]}', "stop"), ('{"kinds": ["text", "te', "length")])
+        R.ask_page = lambda url, model, jpeg, prompt, n, schema=None, cache=True: (sent.append((jpeg[:2], n, schema, cache)) or next(answers))
+        boxes = [[10, 10, 500, 60], [10, 100, 900, 700], [5, 5, 9, 9]]
+        try:
+            got = F.ask_labels(Image.new("RGB", (2000, 2800), "white"), boxes, "u", "m")
+            short = F.ask_labels(Image.new("RGB", (2000, 2800), "white"), boxes, "u", "m")
+            cut = F.ask_labels(Image.new("RGB", (2000, 2800), "white"), boxes, "u", "m")
+        finally:
+            R.ask_page = old
+        self.assertEqual(got, (["title", "equation", None], [False, True, None]))  # a handwritten equation: both
+        self.assertEqual(short, (["text", None, None], [True, None, None]))        # too few answers: the rest unlabelled
+        self.assertEqual(cut, ([None] * 3, [None] * 3))                             # cut off: no labels, the layout's types stay
+        self.assertEqual(sent[0][0], b"\xff\xd8")                                  # a JPEG of the marked page
+        kinds = sent[0][2]["properties"]["kinds"]
+        self.assertEqual((kinds["minItems"], kinds["maxItems"]), (3, 3))            # exactly one kind per box
+        self.assertGreaterEqual(sent[0][1], 32 + 3 * F.LABEL_TOKENS)
+        self.assertFalse(sent[0][3])                                                # the marked page is not kept in the cache
+        self.assertEqual(F.ask_labels(Image.new("RGB", (100, 100)), [], "u", "m"), ([], []))
+
+    def test_label_calls_leave_the_servers_cache_alone_and_labels_only_when_asked(self):
+        """box run: the marked pages filled the vision-LLM servers' prompt cache (5.4 GB each, 2.1 GB RAM free) and fast took
+        2333 s instead of 1550 s"""
+        import io, json as js
+        import review as R
+        bodies = []
+
+        class Answer(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        old = R.urllib.request.urlopen
+        R.urllib.request.urlopen = lambda req, timeout=0: (bodies.append(js.loads(req.data)) or
+                                                            Answer(js.dumps({"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}]}).encode()))
+        try:
+            R.ask_page("http://x", "m", b"jpeg", "p", 5)
+            R.ask_page("http://x", "m", b"jpeg", "p", 5, cache=False)
+        finally:
+            R.urllib.request.urlopen = old
+        self.assertNotIn("cache_prompt", bodies[0])                                 # the audit's page image stays cached
+        self.assertIs(bodies[1]["cache_prompt"], False)
+        labels = {q: R.QUALITY_PROFILES[q]["LABEL_BLOCKS"] for q in R.QUALITY_PROFILES}
+        self.assertEqual(labels, {"express": False, "standard": False, "precise": False})   # the trace only: asked for
+        self.assertTrue(R.quality_option({"QUALITY": "standard", "LABEL_BLOCKS": True}, "LABEL_BLOCKS"))   # --labels
+
+
+class MissedTextRescue(unittest.TestCase):
+    """scans: text the layout put in no block is never read (subset p83: ~15 lines of questions). It is found with Indra's
+    line detector, grouped, padded to its neighbours, read by the OCR and placed in reading order"""
+
+    def test_missed_lines_become_padded_regions_and_noise_is_left_out(self):
+        import figures as F
+        size = (1000, 1400)
+        blocks = [[100, 100, 900, 300], [100, 900, 900, 1200]]
+        lines = [[110, 120, 880, 140],                    # in a block: read already
+                 [120, 400, 860, 420], [120, 430, 800, 450], [120, 460, 870, 480],   # three lines in no block: one region
+                 [5, 1380, 990, 1395],                    # the stack of pages at the photo's bottom border
+                 [300, 700, 340, 760],                    # a tall blob (a pattern), not a line
+                 [600, 820, 640, 838]]                    # one short speck
+        regions = F.missed_regions(lines, [], blocks, size)
+        self.assertEqual(len(regions), 1)
+        (x0, y0, x1, y1), n = regions[0]
+        self.assertEqual(n, 3)
+        self.assertLess(x0, 120); self.assertLess(y0, 400); self.assertGreater(y1, 480)   # padded on every side ...
+        self.assertGreaterEqual(y0, 300)                                                # ... but not into the block above
+        self.assertEqual(F.missed_regions(lines[1:4], [[100, 380, 900, 500]], blocks, size), [])  # inside a picture: its own
+        self.assertEqual(F.missed_regions([], [], blocks, size), [])
+
+    def test_only_text_of_this_page_is_rescued_not_show_through_or_specks(self):
+        """subset: p83's "missed" block read 0.45 as it stands and 0.67 mirrored (the other side's print); a missed header
+        line read 0.9 (p35); specks read nothing"""
+        import numpy as np
+        import figures as F
+        gray = np.full((200, 400), 230, np.uint8)
+
+        def engine(normal, mirrored, found=True):
+            seq = iter([normal, mirrored])
+            return type("E", (), {"detect": staticmethod(lambda a: np.array([[0, 0, 9, 9, 1.0]]) if found else np.zeros((0, 5))),
+                                  "recognize": staticmethod(lambda a, bx: [("t", next(seq), [])])})
+        box = [10, 10, 300, 60]
+        self.assertTrue(F.readable(engine(0.9, 0.5), gray, box))                     # p35's header line
+        self.assertFalse(F.readable(engine(0.45, 0.67), gray, box))                  # mirror-written: shows through
+        self.assertFalse(F.readable(engine(0.5, 0.1), gray, box))                    # too unsure to be text
+        self.assertFalse(F.readable(engine(0.9, 0.1, found=False), gray, box))      # nothing to read: a speck
+        self.assertFalse(F.readable(engine(0.9, 0.1), gray, [500, 500, 600, 600]))  # outside the image
+
+    def test_a_region_goes_where_it_is_read_and_loops_are_refused(self):
+        import figures as F
+        boxes = [[100, 100, 900, 300], [100, 900, 900, 1200]]
+        self.assertEqual(F.reading_slot(boxes, [110, 400, 890, 480]), 1)                 # between the two blocks
+        self.assertEqual(F.reading_slot(boxes, [110, 1250, 890, 1300]), 2)               # after the last
+        two_cols = [[50, 100, 450, 900], [550, 100, 950, 400]]
+        self.assertEqual(F.reading_slot(two_cols, [560, 500, 940, 800]), 2)              # under the right column's block
+        self.assertEqual(F._plain_html("<p>What is OSI model?</p>"), "<p>What is OSI model?</p>")
+        self.assertEqual(F._plain_html("<p></p>"), "")
+        self.assertEqual(F._plain_html("<p>a b</p><p>a b</p><p>a b</p>"), "")          # an OCR loop
+
+    def test_rescued_text_is_added_as_a_block_in_reading_order(self):
+        import types
+        import numpy as np
+        import figures as F
+        mods = {}
+        surya_schema = types.ModuleType("surya.layout.schema")
+        surya_schema.LayoutBox = lambda **k: types.SimpleNamespace(**k)
+        surya_schema.LayoutResult = lambda **k: types.SimpleNamespace(**k)
+        mods["surya.layout.schema"] = surya_schema
+        import enum
+        BT = enum.Enum("BlockTypes", "Text")
+        ms = types.ModuleType("marker.schema"); ms.BlockTypes = BT; mods["marker.schema"] = ms
+
+        class Poly:
+            def __init__(self, bbox): self.bbox = list(bbox)
+            @classmethod
+            def from_bbox(cls, b): return cls(b)
+            def fit_to_bounds(self, b): return self
+        mp = types.ModuleType("marker.schema.polygon"); mp.PolygonBox = Poly; mods["marker.schema.polygon"] = mp
+        mr = types.ModuleType("marker.schema.registry"); mr.get_block_class = lambda t: "TextClass"; mods["marker.schema.registry"] = mr
+        old = {k: sys.modules.get(k) for k in mods}
+        sys.modules.update(mods)
+        try:
+            blk = lambda i, b: types.SimpleNamespace(id=i, polygon=Poly(b))
+            existing = [blk("a", (100, 100, 900, 300)), blk("b", (100, 900, 900, 1200))]
+            added = []
+
+            class Page:
+                page_id, text_extraction_method = 7, "surya"
+                polygon = types.SimpleNamespace(width=1000.0, height=1400.0, size=(1000.0, 1400.0))
+                structure = ["a", "b"]
+                def get_image(self, highres=True): return Image.new("RGB", (1000, 1400), "white")
+                def structure_blocks(self, doc): return existing
+                def add_block(self, cls, poly):
+                    b = types.SimpleNamespace(id=f"new{len(added)}", polygon=poly); added.append(b); return b
+            page = Page()
+            lines = np.array([[120, 400, 860, 420, 1], [120, 430, 800, 450, 1], [120, 460, 870, 480, 1]])
+            asked = []
+
+            def rec(images, layout_results, full_page):
+                asked.append((len(layout_results[0].bboxes), full_page))
+                return [types.SimpleNamespace(blocks=[types.SimpleNamespace(html="<p>2. What is OSI model?</p>", error=False, skipped=False)])]
+            reads = iter([0.9, 0.3] * 10)                                   # as it stands, then mirrored
+
+            class Engine:
+                detect_all = staticmethod(lambda gray: (lines, np.zeros((0, 4))))
+                detect = staticmethod(lambda a: np.array([[0, 0, 10, 5, 1.0]]))
+                recognize = staticmethod(lambda a, bx: [("2. What is OSI model?", next(reads), [])])
+            seen = {}
+            got = F.rescue_missed_text(types.SimpleNamespace(pages=[page]), rec, Engine, seen=seen)
+            self.assertEqual(got, {7: 3})
+            self.assertEqual((list(seen), seen[7][2]), ([7], 1000))                    # kept for the layout listing
+            self.assertEqual(asked, [(1, False)])                                       # one region, read as a block
+            self.assertEqual(page.structure, ["a", "new0", "b"])                       # between the blocks around it
+            self.assertEqual((added[0].html, added[0].text_extraction_method), ("<p>2. What is OSI model?</p>", "surya"))
+            Page.text_extraction_method = "pdftext"
+            self.assertEqual(F.rescue_missed_text(types.SimpleNamespace(pages=[Page()]), rec, Engine), {})   # digital
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+
+class SpreadsOnThePC(unittest.TestCase):
+    def test_a_short_pdf_converted_on_the_pc_is_cut_like_on_the_box(self):
+        """short files are converted by the PC's own workers (md_client.Local), not run_job: they must be cut there too"""
+        import importlib.util
+        try:
+            import pypdfium2  # noqa: F401
+        except ImportError:
+            self.skipTest("pypdfium2 not installed")
+        spec = importlib.util.spec_from_file_location("md_client", Path(__file__).parent.parent / "md_client.py")
+        mc = importlib.util.module_from_spec(spec); spec.loader.exec_module(mc)
+        d = Path(tempfile.mkdtemp(dir=TMP))
+        src = d / "book.pdf"
+        _photo().convert("RGB").save(src, "PDF", resolution=100)
+        sent = []
+        local = object.__new__(mc.Local)
+        local.P, local.busy = P, {}
+        local.pool = type("Pool", (), {"dir": d, "enqueue": lambda self, t: sent.append(t) or "t1"})()
+        local.submit({"label": "book.pdf"}, src, "book", d / "out", {"QUALITY": "express"})
+        self.assertEqual(sent[0]["opts"]["SPREADS"], [0, 0])
+        self.assertNotEqual(sent[0]["src"], str(src))                                  # the cut copy is converted
+        local.submit({"label": "book.pdf"}, src, "book", d / "out", {"SPLIT_SPREADS": False})
+        self.assertEqual(sent[1]["src"], str(src)); self.assertNotIn("SPREADS", sent[1]["opts"])   # --no-split-spreads
+
+
+class Notebook(unittest.TestCase):
+    def test_every_box_module_is_written_by_the_notebook(self):
+        """spreads.py was missing from build_nb.MODULES: the box would fail on `import spreads`"""
+        import ast, re
+        line = re.search(r"^MODULES = (\[.*?\])", (Path(__file__).parent / "build_nb.py").read_text(), re.M).group(1)
+        self.assertEqual(sorted(ast.literal_eval(line)), sorted(p.name for p in (Path(__file__).parent / "mdbox").glob("*.py")))
 
 
 class PreRender(unittest.TestCase):

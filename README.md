@@ -4,9 +4,9 @@
 
 **Turn any document into clean, faithful Markdown on a free Kaggle GPU box, driven from your PC.**
 
-PDFs (digital or scanned), images, Word, PowerPoint, Excel, EPUB, HTML, DjVu, in any language, come back as
-Markdown with text, headings, tables, LaTeX equations, code, figures and the content of every figure. A vision
-model checks the result, and its changes are only kept if they lose nothing.
+PDFs (digital or scanned), photos of book pages, images, Word, PowerPoint, Excel, EPUB, HTML, DjVu, in any
+language, come back as Markdown with text, headings, tables, LaTeX equations, code, figures and the content of
+every figure. A vision model checks the result, and its changes are only kept if they lose nothing.
 
 [![CI](https://github.com/eyasir329/doc-to-markdown/actions/workflows/ci.yml/badge.svg)](https://github.com/eyasir329/doc-to-markdown/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/eyasir329/doc-to-markdown)](https://github.com/eyasir329/doc-to-markdown/releases/latest)
@@ -33,11 +33,14 @@ model checks the result, and its changes are only kept if they lose nothing.
 - **Nothing silently lost.** Every change a model proposes is checked before it is kept. No word or number of
   the page may disappear, nothing may be invented, and a page's printed text (its PDF text layer) has the final
   say wherever it exists. See [How accuracy is protected](docs/accuracy.md).
-- **Figures are content, not decoration.** Figures are cropped to the figure itself, and each one is described.
-  Flow charts and UML diagrams become [Mermaid](https://mermaid.js.org/) charts, and pictures of text (a
-  newspaper page, a letter) are transcribed in full.
-- **Every script.** Bengali, Hindi and other Indic scripts, Chinese, Japanese, Arabic, Cyrillic and more, with
-  repairs for the typical OCR and PDF-text errors of Indic scripts.
+- **Three clear speed/accuracy levels.** `express` makes no vision-LLM call, `standard` uses it only on the pages
+  that need it, `precise` gives every page every check. See [Quality modes](docs/quality-modes.md).
+- **Scans and phone photos handled.** Pages are set upright, a photo of two facing book pages is cut into its two
+  pages, and text the layout missed is still read.
+- **Figures are content, not decoration.** Figures are cropped to the figure itself, the text inside them is read,
+  and each one is described by its meaning. Flowcharts become [Mermaid](https://mermaid.js.org/) charts.
+- **Every script.** Bengali, Hindi and other Indic scripts, Chinese, Japanese, Hebrew, Arabic, Cyrillic and more,
+  with repairs for the typical OCR and PDF-text errors of Indic scripts.
 - **Long books and many files.** Documents are split into page chunks and spread over all workers. Long
   documents come back in batches, each saved as soon as it's done, and an interrupted run resumes where it
   stopped.
@@ -59,18 +62,16 @@ flowchart LR
   API -- "Markdown + images + report" --> C
 ```
 
-1. **[Marker](https://github.com/datalab-to/marker)** finds the layout and reads the text: the PDF's own text
-   where it is good, otherwise the Surya OCR model on the GPUs. It also extracts tables, equations and figures.
-2. **Deterministic repairs**, no model involved:
-   - figures re-cropped so labels aren't cut off;
-   - tables checked against the page image;
-   - OCR slips corrected from the PDF's own text;
-   - Indic vowel-order fixes;
-   - equation numbers turned into `\tag{}`;
-   - Markdown clean-up.
-3. **A vision LLM** (Qwen3-VL-8B, one server per GPU) describes figures, reviews pages and proofreads them line
-   by line. Each of its changes passes a loss check before it is kept.
-4. The result comes back as `<name>/<name>.md`, its images and a `report.json`. The report records what was
+1. **Scans first.** Pages without a text layer are set upright, and two-page book photos are cut in two.
+2. **[Marker](https://github.com/datalab-to/marker)** finds the layout and reads the text: the PDF's own text
+   where it is good, otherwise the Surya OCR model on the GPUs. Text lines the layout left out are read too.
+3. **Deterministic repairs**, no model involved: figures re-cropped so labels aren't cut off, tables checked
+   against the page image, OCR slips corrected from the PDF's own text, Indic vowel-order fixes, equation numbers as
+   `\tag{}`, headings from the PDF outline, Markdown clean-up.
+4. **A vision LLM** (Qwen3-VL-8B, one server per GPU), in `standard` and `precise`, checks pages against their
+   images (an element check, exact corrections each confirmed, in `precise` a line-by-line rewrite) and describes
+   figures. Each of its changes passes a loss check before it is kept.
+5. The result comes back as `<name>/<name>.md`, its images and a `report.json`. The report records what was
    checked, what was changed, and how busy the box's GPUs, CPUs and RAM were.
 
 ## Quick start
@@ -88,7 +89,8 @@ After about 10 minutes the log shows **BOX READY**. Details: [Getting started](d
 ```bash
 python md_client.py book.pdf                      # -> markdown_out/book/book.md + images + report.json
 python md_client.py ./papers --out ./md           # a whole folder (sub-folders kept)
-python md_client.py scan.pdf --quality accurate   # the most careful mode
+python md_client.py big.pdf --quality express     # fastest: no vision-LLM pass
+python md_client.py scan.pdf --quality precise    # the most careful mode
 python md_client.py --health                      # is the box up? GPUs, workers, memory
 ```
 
@@ -97,35 +99,31 @@ pass `--url` with the address from the BOX READY banner.
 
 ## Quality modes
 
-| | `fast` | `balanced` (default) | `accurate` |
+| | `express` | `standard` (default) | `precise` |
 |---|---|---|---|
-| OCR, figure crops, table/formula fixes, text-layer repair | ✓ | ✓ | ✓ |
-| Figure descriptions, figures cropped to themselves | ✓ | ✓ | ✓ |
-| Flow diagrams → Mermaid | 1 read | 2 reads + missing-arrow check | 3 reads + check |
-| Marker's own LLM steps (tables, equations, headings) | – | ✓ | ✓ (+ inline maths) |
-| Pictures of text transcribed in full | – | ✓ | ✓ |
-| Page review by the vision LLM | – | whole page | section by section |
-| Line-by-line audit, every fix double-checked | 1 pass, large sections | 1 pass | 2 passes, smaller sections |
-| **27-page benchmark: time** | **520 s** | **1068 s** | **1192 s** |
-| **27-page benchmark: checks passed** | **56 / 59** | **57 / 59** | **56 / 59** |
+| Scans upright, two-page photos cut, OCR, figure crops, table/formula fixes, text-layer repair | ✓ | ✓ | ✓ |
+| Text inside pictures read by the OCR | ✓ | ✓ | ✓ |
+| Vision-LLM page checks: element check + exact corrections | – | pages that need them | every page |
+| Line-by-line rewrite, prose made explicit (original wording kept) | – | – | ✓ |
+| Figures described by meaning, flowcharts → Mermaid | – | pages with diagrams or charts | every figure |
+| **30-page regression set: time** | **233 s** | **842 s** | **2107 s** |
+| **Pages per hour** | **466** | **128** | **51** |
+| **Regression checks passed** | **10 / 10** | **13 / 13** | **11 / 11** |
 
-The benchmark is a 27-page test document with one hard case per page:
-- UML diagrams, dense LaTeX, C and R code, charts;
-- a 1900 newspaper scan and a 1794 handwritten invoice;
-- Bengali and Chinese text;
-- multi-panel figures and tables.
-
-The table shows the latest run of each mode on Kaggle 2×T4 in November 2026. Times vary by about ±10% between
-runs, and a check or two flips between runs because the LLM's answers vary. A later balanced run passed 58/59.
-The document contains personal data, so it isn't published. [Quality modes](docs/quality-modes.md) explains
-how to choose a mode and how to measure the same trade-off on your own documents.
+The regression set has one hard case per page: seven two-page book photos and pages that must not be cut,
+upside-down and sideways photos, handwritten notes, degraded historical scans, receipts and invoices, tables, maths,
+code, charts and flowcharts, and Chinese, Devanagari and Hebrew text. It was run on Kaggle 2×T4 with release 2.0.0.
+It contains third-party and personal scans, so it isn't published. In every mode all 30 pages came back, every
+two-page photo and nothing else was cut, and no page repeated itself; `standard` kept 38 of the vision LLM's
+corrections and `precise` 118. [Quality modes](docs/quality-modes.md) explains how to choose and how to measure the
+trade-off on your own documents.
 
 ## Supported inputs
 
 | Kind | Formats |
 |---|---|
 | PDF | digital and scanned (OCR), with or without a text layer |
-| Images | PNG, JPEG, WebP, TIFF, GIF, BMP |
+| Images | PNG, JPEG, WebP, TIFF, GIF, BMP, including phone photos of book pages |
 | Office | Word, PowerPoint, Excel and OpenDocument, old and new: `.docx` `.doc` `.rtf` `.odt` · `.pptx` `.ppt` `.odp` · `.xlsx` `.xls` `.ods` and their variants (via LibreOffice) |
 | Other | EPUB, HTML, DjVu, TXT, Markdown, CSV/TSV, and `.zip` archives of any of these |
 
@@ -137,23 +135,25 @@ The full list is in [Usage → Supported inputs](docs/usage.md#supported-inputs)
 |---|---|
 | [Getting started](docs/getting-started.md) | Kaggle setup step by step, the client, your first conversion |
 | [Usage](docs/usage.md) | every client option, batches and resume, local workers, outputs and `report.json` |
-| [Quality modes](docs/quality-modes.md) | what each mode does, benchmarks, choosing a mode, measuring your own |
-| [How accuracy is protected](docs/accuracy.md) | the loss checks, the audit, text-layer repair, what is never changed |
-| [Architecture](docs/architecture.md) | components, data flow, scheduling, memory safety, GPU servers |
-| [Configuration](docs/configuration.md) | every notebook setting and environment variable |
-| [Performance](docs/performance.md) | where time goes, resource use, tuning |
+| [Quality modes](docs/quality-modes.md) | what each mode does, how `standard` decides per page, measured results, choosing a mode |
+| [How accuracy is protected](docs/accuracy.md) | scans first, the loss checks, the element check, the audit, what is never changed |
+| [Architecture](docs/architecture.md) | components, data flow, scheduling, memory safety, GPU servers, failure handling |
+| [Configuration](docs/configuration.md) | every notebook setting, per-job option and environment variable |
+| [Performance](docs/performance.md) | where time goes, resource use, the regression checks, tuning |
 | [HTTP API](docs/api.md) | the box's endpoints, for your own clients |
 | [Troubleshooting](docs/troubleshooting.md) | common problems and what log lines mean |
-| [Development](docs/development.md) | repository layout, tests without a GPU, building the notebook |
-| [Design notes](docs/design-notes.md) | the detailed engineering log: every decision and what it was measured on |
+| [Development](docs/development.md) | repository layout, tests without a GPU, benchmarks, building the notebook |
+| [Design notes](docs/design-notes.md) | why the pipeline is built the way it is |
 
 ## Limitations
 
 - Kaggle sessions end after at most 12 hours (the notebook stops at 8.5 h and when idle), and the free quota is
   30 GPU-hours a week.
 - The vision LLM is an 8B model: excellent at reading, but it can misjudge rare symbols. That's why every one of
-  its changes is checked, and why `accurate` asks it twice about each correction.
-- Vertical Japanese text, very degraded scans and handwriting are read on a best-effort basis.
+  its changes is checked, and why each correction must be confirmed by the page's text or picked twice.
+- `express` has no vision-LLM checks: it keeps all the text the OCR reads, OCR slips included.
+- Handwriting, very degraded scans and vertical Japanese text are read on a best-effort basis; use `precise` and
+  read the result.
 - Converting with `GOOGLE_API_KEY` (a Gemini fallback, off unless you add the key) sends page content to Google.
   Otherwise nothing leaves your Kaggle session except the results you download.
 

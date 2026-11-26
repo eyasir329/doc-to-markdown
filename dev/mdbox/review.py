@@ -65,6 +65,7 @@ def _no_space(ch):
 
 
 import unicodedata
+from collections import Counter
 
 
 def script_tokens(text, ngram=1):
@@ -292,14 +293,17 @@ def set_llm_inflight(n):
     LLM_GATE = _threading.BoundedSemaphore(int(n) if n and int(n) > 0 else 10 ** 6)
 
 
-def ask_page(llm_url, model, jpeg, prompt, max_tokens, timeout=900, schema=None):
-    """-> (text, finish_reason); schema: a JSON schema the answer must follow"""
+def ask_page(llm_url, model, jpeg, prompt, max_tokens, timeout=900, schema=None, cache=True):
+    """-> (text, finish_reason); schema: a JSON schema the answer must follow. cache=False: the server keeps nothing of this
+    request (an image no other call sends, e.g. the page with numbered boxes: kept, it filled the servers' RAM)"""
     body = {"model": model, "temperature": 0, "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}},
                 {"type": "text", "text": prompt}]}]}
     if schema:
         body["response_format"] = {"type": "json_schema", "json_schema": {"name": "answer", "strict": True, "schema": schema}}
+    if not cache:
+        body["cache_prompt"] = False                     # llama-server: no prompt cache for this one
     req = urllib.request.Request(llm_url.rstrip("/") + "/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer local"})
     with LLM_GATE:
@@ -503,7 +507,7 @@ def review_pages(md_path, src, llm_url, model, concurrency=2, ctx=8192, keep_hea
         p, text = pages[k]
         jpeg, layer = inputs[p]
         layer = layer if use_layer else ""
-        if skip_settled and page_settled(text, layer):        # balanced: the PDF's own text already is this page
+        if skip_settled and page_settled(text, layer):        # the PDF's own text already is this page
             new, why = text.strip("\n"), "settled by the text layer"
         else:
             new, why = review_page(text.strip("\n"), jpeg, layer, llm_url, model, ctx, keep_headers, part_tokens)
@@ -523,7 +527,7 @@ def review_pages(md_path, src, llm_url, model, concurrency=2, ctx=8192, keep_hea
     return stats
 
 
-# ----------------------------------------------------------------- line-by-line audit (accurate quality)
+# ----------------------------------------------------------------- line-by-line audit (standard and precise)
 # A whole-page rewrite keeps missing small things: an OCR's 李生 for 孪生, \sqrt[2]{2} for the printed \sqrt{2}, y^n for y^m.
 # Each section of a page is proofread against the image; the model lists exact corrections, and each one is applied on its own
 # only when it is a small local change that the PDF's own text confirms, or that a second, independent look at the image
@@ -650,6 +654,24 @@ def settled(section, layer):
     return len(words) >= 5 and not (Counter(words) - Counter(_tokens(layer)))
 
 
+AUDIT_PAGE_TOKENS = 4200   # a page's Markdown + its PDF text in one audit call: with the image (~1500) and the answer (800) it
+                           # fits the 8192-token context of a slot
+
+
+def whole_page_sections(paras, layer):
+    """section size 0: the whole page in ONE audit call (fast), unless the page and its PDF text would not fit the context:
+    then as few parts as fit (a failed call would leave the page unaudited)"""
+    budget = max(800, AUDIT_PAGE_TOKENS - _need(layer or ""))
+    secs, cur = [], []
+    for p in paras:
+        if cur and _need("\n\n".join(cur + [p])) > budget:
+            secs.append("\n\n".join(cur)); cur = []
+        cur.append(p)
+    if cur:
+        secs.append("\n\n".join(cur))
+    return secs
+
+
 def audit_page(text, jpeg, layer, llm_url, model, stats, sizes=(AUDIT_SECTION_PARAS,), workers=1):
     """one page, pass after pass (sections of `sizes[i]` paragraphs; a second pass in smaller sections finds what the first
     missed). Sections go one after the other: the server keeps the page image from the previous call (2.8 s of GPU time
@@ -658,7 +680,10 @@ def audit_page(text, jpeg, layer, llm_url, model, stats, sizes=(AUDIT_SECTION_PA
     lock = stats.setdefault("_lock", threading.Lock())
     for size in sizes:
         paras = text.strip("\n").split("\n\n")
-        secs = ["\n\n".join(paras[j:j + int(size)]) for j in range(0, len(paras), int(size))]
+        if int(size):
+            secs = ["\n\n".join(paras[j:j + int(size)]) for j in range(0, len(paras), int(size))]
+        else:
+            secs = whole_page_sections(paras, layer)
 
         def one(sec):
             if not re.search(r"\w", sec):
@@ -675,22 +700,448 @@ def audit_page(text, jpeg, layer, llm_url, model, stats, sizes=(AUDIT_SECTION_PA
     return text
 
 
+# ----------------------------------------------------------------- inspection: every element of a page questioned (standard, precise)
+INSPECT_PROMPT = """Below is the Markdown of one document page, split into numbered ELEMENTS ([E1], [E2], ...). Check every element
+against the page image and question it: is it the right KIND of content and written as that kind?
+- a heading (and its level relative to the page), a paragraph, a list (bullets/numbers, nesting), a table (all rows and columns),
+  a code block (in ``` fences, exact text), a display formula ($$...$$) or inline maths ($...$) in LaTeX, a caption, a footnote,
+  a quote, a page header or footer;
+- maths written as plain text (or plain text wrongly written as maths), code not in a code block, a table that is not a table
+  or a table with rows/columns wrong, one paragraph split into several elements or two paragraphs merged into one, a list
+  written as a paragraph, a wrong heading level, words of the page missing from the element.
+Report ONLY elements that are wrong, each with "elements": the numbers of the consecutive element(s) the fix replaces (several
+when they must be merged), "problem": what is wrong in a few words, "markdown": the corrected Markdown for exactly those
+elements - every word, number and symbol of the page kept, nothing invented, nothing from other elements. Tokens like <<KEEP 2>>
+are figures: keep each exactly once and never move it. Everything right: an empty list.
+Then look for what the page shows that is in NO element at all, and list it in "missing":
+- a figure, chart, diagram or photo with no <<KEEP n>> token for it: "kind": "figure", "bbox_2d": its box [x0, y0, x1, y1] in
+  the page image on a 0-1000 scale, "markdown": "";
+- text left out entirely (a paragraph, a line, a footnote, a label, a list item): "kind": "text", "markdown": that text in
+  Markdown exactly as printed, "bbox_2d": [];
+each with "after": the number of the element it comes after (0 = before the first). Nothing missing: an empty list.
+
+ELEMENTS:
+<<ELEMENTS>>"""
+INSPECT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["fixes", "missing"], "properties": {
+    "fixes": {"type": "array",
+              "items": {"type": "object", "additionalProperties": False, "required": ["elements", "problem", "markdown"],
+                        "properties": {"elements": {"type": "array", "items": {"type": "integer"}}, "problem": {"type": "string"},
+                                       "markdown": {"type": "string"}}}},
+    "missing": {"type": "array",
+                "items": {"type": "object", "additionalProperties": False, "required": ["kind", "after", "bbox_2d", "markdown"],
+                          "properties": {"kind": {"type": "string", "enum": ["figure", "text"]}, "after": {"type": "integer"},
+                                         "bbox_2d": {"type": "array", "items": {"type": "number"}},
+                                         "markdown": {"type": "string"}}}}}}
+PRINTED_PROMPTS = ('Look carefully at the page image. Is this text printed on the page (exactly, or with only small differences)?\n'
+                   '«<<TEXT>>»\nAnswer "yes" or "no".',
+                   'Does the page in the image contain the following passage? Answer "yes" only if you can actually see it on '
+                   'the page, otherwise "no".\n«<<TEXT>>»')
+PRINTED_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["answer"],
+                  "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}}}
+
+
+def missing_text_ok(new, page_md, layer, jpeg, llm_url, model):
+    """text the inspection says the Markdown lacks -> (ok, why). It must be new (mostly words the page's Markdown does not have)
+    and on the page: in the PDF's own text when there is one, else the vision LLM must say yes to two differently put questions
+    (an answer it made up does not survive being asked twice)"""
+    words = [w.lower() for w in WORD.findall(new)]
+    if not words:
+        return False, "no words"
+    have = {w.lower() for w in WORD.findall(page_md)}
+    if sum(w not in have for w in words) < max(2, 0.5 * len(words)):
+        return False, "already in the page"
+    if (layer or "").strip():
+        lay = {w.lower() for w in WORD.findall(layer)}
+        return (True, "") if sum(w in lay for w in words) >= 0.9 * len(words) else (False, "not in the page's text")
+    for q in PRINTED_PROMPTS:
+        try:
+            a, _ = ask_page(llm_url, model, jpeg, q.replace("<<TEXT>>", new[:1500]), 20, schema=PRINTED_SCHEMA)
+            if latex_json_loads(a).get("answer") != "yes":
+                return False, "not confirmed on the image"
+        except Exception:
+            return False, "not confirmed on the image"
+    return True, ""
+INSPECT_TOKENS = 2400      # elements per inspection call: room for the image (~1500) and an answer that rewrites some of them
+
+
+def page_elements(text):
+    """a page's Markdown -> its elements (blocks between blank lines), a code block or a $$ formula kept whole even when it
+    has blank lines inside"""
+    out, cur = [], []
+    for block in text.strip("\n").split("\n\n"):
+        cur.append(block)
+        joined = "\n\n".join(cur)
+        if len(re.findall(r"(?m)^\s*(```|~~~)", joined)) % 2 or len(re.findall(r"(?<!\\)\$\$", joined)) % 2:
+            continue                                  # still inside a code block / a display formula
+        out.append(joined); cur = []
+    if cur:
+        out.append("\n\n".join(cur))
+    return out
+
+
+def apply_inspection(els, fixes, kept, layer, stats, missing=None, add=None):
+    """the fixes that pass the loss check (accept) and keep every formula and code block -> new element list.
+    A fix names consecutive elements; it replaces them with its Markdown. missing: content the page shows that no element has;
+    add(item) -> its Markdown or None (the caller checks the evidence and crops a missing figure); inserted after its "after" element"""
+    n0 = len(els)
+    done = []
+    for f in sorted(fixes, key=lambda f: -min(f.get("elements") or [0])):
+        ids = sorted({int(i) for i in f.get("elements") or []})
+        if not ids or ids[0] < 1 or ids[-1] > len(els) or ids != list(range(ids[0], ids[-1] + 1)) or \
+                any(set(ids) & d for d in done):
+            stats["inspect refused: bad element numbers"] = stats.get("inspect refused: bad element numbers", 0) + 1
+            continue
+        old, new = "\n\n".join(els[ids[0] - 1:ids[-1]]), (f.get("markdown") or "").strip("\n")
+        if new.strip() == old.strip():
+            continue
+        why = ""
+        if len(re.findall(r"(?<!\\)\$", old)) > len(re.findall(r"(?<!\\)\$", new)):
+            why = "would drop maths"
+        elif len(re.findall(r"(?m)^\s*(```|~~~)", old)) > len(re.findall(r"(?m)^\s*(```|~~~)", new)):
+            why = "would drop a code block"
+        elif any(old.count(m) > new.count(m) for m in ("**", "`")) or \
+                len(re.findall(r"(?<![*\\])\*(?!\*)", old)) > len(re.findall(r"(?<![*\\])\*(?!\*)", new)):
+            why = "would drop formatting"             # suite run: **TARGET MD:** came back as plain text
+        elif len(re.findall(r"  $|<br\s*/?>", old, re.M)) > len(re.findall(r"  $|<br\s*/?>", new, re.M)):
+            why = "would drop line breaks"            # suite run: lines with a forced break ran together
+        else:
+            ok, why = accept(old, new, {t: v for t, v in kept.items() if t in old}, layer)
+            why = "" if ok else why
+        if why:
+            stats[f"inspect refused: {why}"] = stats.get(f"inspect refused: {why}", 0) + 1
+            continue
+        els[ids[0] - 1:ids[-1]] = [new] + [None] * (len(ids) - 1)
+        done.append(set(ids))
+        stats["inspect fixes"] = stats.get("inspect fixes", 0) + 1
+        ex = stats.setdefault("examples", [])
+        if len(ex) < 12:
+            ex.append(f"[inspect] {f.get('problem', '')[:80]}")
+    ins = {}
+    for it in missing or []:
+        try:
+            after = int(it.get("after", -1))
+        except (TypeError, ValueError):
+            after = -1
+        if not 0 <= after <= n0:
+            stats["missing refused: bad position"] = stats.get("missing refused: bad position", 0) + 1
+            continue
+        md = add(it) if add else None
+        if md:
+            ins.setdefault(after, []).append(md)
+    out = list(ins.get(0, []))
+    for k, e in enumerate(els):
+        if e is not None:
+            out.append(e)
+        out += ins.get(k + 1, [])
+    return out
+
+
+def inspect_page(text, jpeg, layer, llm_url, model, stats, add_figure=None):
+    """every element of the page questioned against the image (kind, structure, completeness); the wrong ones fixed
+    when the fix loses and invents nothing; what the page shows but no element has is added (text with evidence, a figure
+    cropped from the page by add_figure(bbox) -> file name) -> the page"""
+    protected, kept = protect(text)
+
+    def add(it):
+        kind = it.get("kind")
+        if kind == "figure":
+            if add_figure is None:
+                return None
+            name, why = add_figure(it.get("bbox_2d") or [])
+            key = "missing figures added" if name else f"missing figure refused: {why.split(' (')[0]}"
+            stats[key] = stats.get(key, 0) + 1
+            return f"![]({name})" if name else None
+        new = (it.get("markdown") or "").strip()
+        ok, why = missing_text_ok(new, text, layer, jpeg, llm_url, model) if new else (False, "empty")
+        key = "missing text added" if ok else f"missing text refused: {why}"
+        stats[key] = stats.get(key, 0) + 1
+        if ok:
+            ex = stats.setdefault("examples", [])
+            if len(ex) < 12:
+                ex.append(f"[added] {new[:80]}")
+        return new if ok else None
+    els = page_elements(protected)
+    out, start = [], 0
+    while start < len(els):                           # as few calls as fit the context: normally one per page
+        end, used = start, 0
+        while end < len(els) and (end == start or used + _need(els[end]) <= INSPECT_TOKENS):
+            used += _need(els[end]); end += 1
+        part = els[start:end]
+        numbered = "\n\n".join(f"[E{k + 1}]\n{e}" for k, e in enumerate(part))
+        stats["inspected elements"] = stats.get("inspected elements", 0) + len(part)
+        try:
+            answer, finish = ask_page(llm_url, model, jpeg, INSPECT_PROMPT.replace("<<ELEMENTS>>", numbered),
+                                      min(3500, int(1.3 * used) + 600), schema=INSPECT_SCHEMA)
+            j = latex_json_loads(answer) if finish != "length" else {}
+            fixes, missing = j.get("fixes") or [], j.get("missing") or []
+        except Exception:
+            fixes, missing = [], []
+            stats["inspect calls failed"] = stats.get("inspect calls failed", 0) + 1
+        out += apply_inspection(list(part), fixes, kept, layer, stats, missing, add)
+        start = end
+    return restore("\n\n".join(out), kept)
+
+
+# ----------------------------------------------------------------- enhancement: prose written professionally (precise)
+ENHANCE_PROMPT = r"""Below are numbered PARAGRAPHS of one document page (the page itself is in the image). They may have been read
+inaccurately. Compare each with the page; where a paragraph does not match the page or is unclear, rewrite it professionally
+so that it reads clearly and its meaning is fully explicit, staying as close to the original as possible:
+- where the converted text is broken or garbled, write what the page actually says;
+- make the meaning explicit: expand an abbreviation on its first use, name what "it"/"this" refers to, add a short
+  clarification where a term needs one to be understood;
+- KEEP every fact, word, name, number, symbol and formula of the original; never drop, change or contradict information and
+  never add facts, numbers, formulas, derivations or reasoning the page does not show;
+- the same language and script, the same Markdown formatting (**bold**, *italic*, `code`, $maths$, \$ escapes).
+Return only paragraphs you rewrote (an accurate, clear paragraph: leave it out), each with "paragraph" (its number) and
+"text" (the rewritten paragraph).
+
+PARAGRAPHS:
+<<PARAGRAPHS>>"""
+ENHANCE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["paragraphs"], "properties": {"paragraphs": {
+    "type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["paragraph", "text"],
+                               "properties": {"paragraph": {"type": "integer"}, "text": {"type": "string"}}}}}}
+ENHANCE_TOKENS = 1800      # paragraphs per enhancement call: their rewrites (up to ~2x longer) must fit the answer and context
+NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+ORIGINAL_BLOCK = "\n\n<details><summary>Original wording</summary>\n\n{}\n\n</details>"
+
+
+def prose(el):
+    """an element the enhancement may rewrite: a plain paragraph (not a heading, list, table, code, formula, quote or figure)"""
+    t = el.strip()
+    return bool(t) and len(WORD.findall(t)) >= 6 and not re.match(r"(#|\||>|!\[|<<KEEP|```|~~~|\$\$|[-*+] |\d+[.)] |<)", t) \
+        and "<<KEEP" not in t and "<details>" not in t
+
+
+def enhanced_ok(old, new):
+    """(ok, why): the rewrite keeps the original's information - its words (95%), every number, its maths and formatting -
+    adds no number (a number fix needs the audit's second look) and is not padded beyond use (2.5x)"""
+    if not new.strip() or new.strip() == old.strip():
+        return False, "unchanged"
+    have = {w.lower() for w in WORD.findall(new)}
+    words = {w.lower() for w in WORD.findall(old)}
+    if words and sum(w in have for w in words) < 0.95 * len(words):
+        return False, "words lost"
+    if Counter(NUMBER.findall(old)) - Counter(NUMBER.findall(new)):
+        return False, "number lost"
+    if Counter(NUMBER.findall(new)) - Counter(NUMBER.findall(old)):
+        return False, "number added"        # run2 p74: "sin(wt-15) = sin(wt+105) due to periodicity", made up; numbers are the audit's
+    for mark in ("$", "**", "`"):
+        if old.count(mark) > new.count(mark):
+            return False, "formatting lost"
+    if len(new) > 2.5 * len(old) + 300:
+        return False, "too long"
+    return True, ""
+
+
+ENHANCE_ACCURATE = 0.99   # a paragraph with this share of its words in the page's own text was extracted right: no rewrite
+
+
+def needs_enhancing(el, layer_words):
+    """True when a prose paragraph may have been read inaccurately: fewer than 99% of its words are in the page's text layer,
+    or the page has none (a scan: nothing to measure it against, the vision LLM decides)"""
+    words = [w.lower() for w in WORD.findall(el)]
+    if not layer_words or not words:
+        return True
+    return sum(w in layer_words for w in words) < ENHANCE_ACCURATE * len(words)
+
+
+def enhance_page(text, jpeg, llm_url, model, stats, layer=""):
+    """precise's last step: each prose paragraph that may be inaccurate written again professionally and more explicitly
+    (the page image for the meaning); a rewrite that keeps all the information replaces it, the author's exact wording
+    follows in a collapsed block. A paragraph the page's own text confirms (99%) is left as it is"""
+    els = page_elements(text)
+    layer_words = {w.lower() for w in WORD.findall(layer or "")}
+    todo = []
+    for k, e in enumerate(els):
+        if not prose(e):
+            continue
+        if needs_enhancing(e, layer_words):
+            todo.append(k)
+        else:
+            stats["enhance skipped: confirmed by the page's text"] = stats.get("enhance skipped: confirmed by the page's text", 0) + 1
+    start = 0
+    while start < len(todo):
+        part, used = [], 0
+        while start < len(todo) and (not part or used + _need(els[todo[start]]) <= ENHANCE_TOKENS):
+            part.append(todo[start]); used += _need(els[todo[start]]); start += 1
+        numbered = "\n\n".join(f"[P{i + 1}]\n{els[k]}" for i, k in enumerate(part))
+        try:
+            answer, finish = ask_page(llm_url, model, jpeg, ENHANCE_PROMPT.replace("<<PARAGRAPHS>>", numbered),
+                                      min(4000, int(2.6 * used) + 400), schema=ENHANCE_SCHEMA)
+            items = (latex_json_loads(answer).get("paragraphs") or []) if finish != "length" else []
+        except Exception:
+            items = []
+            stats["enhance calls failed"] = stats.get("enhance calls failed", 0) + 1
+        done = set()
+        for it in items:
+            try:
+                i = int(it.get("paragraph"))
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= i <= len(part) or i in done:      # 0 would be part[-1] (another paragraph); a second answer for one
+                continue                                  # would be checked against its own rewrite
+            done.add(i)
+            k = part[i - 1]
+            old, new = els[k], (it.get("text") or "").strip()
+            ok, why = enhanced_ok(old, new)
+            key = "paragraphs enhanced" if ok else f"enhance refused: {why}"
+            stats[key] = stats.get(key, 0) + 1
+            if ok:
+                els[k] = new + ORIGINAL_BLOCK.format(old.strip())
+    return "\n\n".join(els)
+
+
+# ----------------------------------------------------------------- standard: the page scanned first, then the passes it needs
+TRIAGE_PROMPT = """Look at this document page and describe what is on it, so the right tools can be chosen to convert it.
+Return JSON: "page_type": "digital text", "scan", "handwriting", "slides", "form" or "mixed"; "maths", "tables", "code",
+"diagrams" (flowcharts, UML, schematics), "charts" (plots, graphs), "photos", "non_latin" (a non-Latin script): true/false;
+"clean": true if the text is crisp and easy to read (no blur, noise, skew, stains); "difficulty": 1 (plain text), 2 (some
+structure: tables, formulas, figures, columns) or 3 (hard: handwriting, degraded scan, dense maths, complex layout)."""
+TRIAGE_SCHEMA = {"type": "object", "additionalProperties": False,
+                 "required": ["page_type", "maths", "tables", "code", "diagrams", "charts", "photos", "non_latin", "clean", "difficulty"],
+                 "properties": {"page_type": {"type": "string", "enum": ["digital text", "scan", "handwriting", "slides", "form", "mixed"]},
+                                **{k: {"type": "boolean"} for k in ("maths", "tables", "code", "diagrams", "charts", "photos",
+                                                                    "non_latin", "clean")},
+                                "difficulty": {"type": "integer", "enum": [1, 2, 3]}}}
+# standard: the page passes a page gets after its triage (page_level). precise gives every page all of them and more
+# (QUALITY_PROFILES), so standard never runs the line pass or the prose rewrite: those made auto cost as much as accurate on
+# the scan subset (35 of 104 pages went to accurate: 4750 s vs accurate 5274 s, balanced 3210 s)
+PAGE_LEVELS = {
+    "none": dict(INSPECT=False, AUDIT=False, AUDIT_SECTIONS=(0,)),     # its own text settles it: no vision-LLM pass
+    "audit": dict(INSPECT=False, AUDIT=True, AUDIT_SECTIONS=(0,)),     # plain, clean text: one whole-page audit
+    "inspect": dict(INSPECT=True, AUDIT=True, AUDIT_SECTIONS=(0,)),    # tables, maths, code, figures, scans, forms, noise
+    "hard": dict(INSPECT=True, AUDIT=True, AUDIT_SECTIONS=(3,)),       # handwriting, degraded or dense pages: a finer audit
+}
+PLAIN_BLOCKS = {"Text", "SectionHeader", "ListGroup", "ListItem", "Caption", "Footnote", "PageHeader", "PageFooter"}
+
+
+def triage_page(jpeg, llm_url, model):
+    """standard: what is on the page (one short call; the server keeps the image for the page's next calls) -> dict or None"""
+    try:
+        answer, finish = ask_page(llm_url, model, jpeg, TRIAGE_PROMPT, 200, schema=TRIAGE_SCHEMA)
+        tri = latex_json_loads(answer) if finish != "length" else None
+        return tri if isinstance(tri, dict) and all(k in tri for k in TRIAGE_SCHEMA["required"]) else None   # incomplete: failed
+    except Exception:
+        return None
+
+
+def page_level(tri, text, layer):
+    """standard: -> (a PAGE_LEVELS name for this page from its triage, why). A failed triage gets "inspect" (the safe middle)"""
+    if not tri:
+        return "inspect", "page scan failed"
+    rich = any(tri.get(k) for k in ("maths", "tables", "code", "diagrams", "charts"))
+    scan = not (layer or "").strip()          # a page with a text layer has its own characters to check against: the triage's
+    if tri.get("page_type") == "handwriting" or (scan and (int(tri.get("difficulty") or 2) >= 3 or not tri.get("clean"))):
+        return "hard", "hard page"            # "difficulty 3" alone sent the digital cover of the regression set to the finer audit
+    if (layer or "").strip() and page_settled(text, layer) and not rich:
+        return "none", "settled by the page's text"
+    if rich or not tri.get("clean") or tri.get("page_type") in ("scan", "mixed", "form"):
+        return "inspect", "structured or noisy page"
+    return "audit", "plain text page"
+
+
+def quiet_page(text, layer, layout):
+    """standard: a page that needs no vision-LLM call at all, not even the triage: every word of it is the PDF's own text
+    (page_settled), it has no picture, and the layout found only text blocks on it (layout: the worker's block counts for
+    the page, None = unknown). Most pages of a digital book"""
+    if not layout or "![" in text or not (layer or "").strip():
+        return False
+    blocks = {k for k, v in layout.items() if not str(k).startswith("_") and v}
+    return blocks <= PLAIN_BLOCKS and page_settled(text, layer)
+
+
 def _public(stats):
     return {k: v for k, v in stats.items() if not k.startswith("_")}
 
 
-def audit_pages(md_path, src, llm_url, model, concurrency=2, use_layer=True, sizes=(AUDIT_SECTION_PARAS,)):
+def audit_pages(md_path, src, llm_url, model, concurrency=2, use_layer=True, sizes=(AUDIT_SECTION_PARAS,), inspect=False,
+                add_figure=None, line_review=0, ctx=8192, keep_headers=False, skip_settled=True, enhance=False,
+                triage=False, decisions=None, trace=None):
     """proofreads every page of a Markdown file with page separators (in place) -> stats. (With the page review on, the
-    worker audits each page right after its review instead: review_pages(after=...))"""
+    worker audits each page right after its review instead: review_pages(after=...)). triage (standard): each page gets the
+    passes of its PAGE_LEVELS level instead of inspect/line_review/sizes/enhance. trace (a dict) gets, per page, its level,
+    the steps it got, their seconds and its own counts: what a later tuning run compares by kind of page; its "layout" block
+    counts (written by the worker before) let a quiet page skip the triage"""
+    import threading
+    import time
     md_path = Path(md_path); md = md_path.read_text(encoding="utf-8")
     parts = PAGE_SPLIT.split(md)
     pre, pages = parts[0], [[int(parts[i]), parts[i + 1]] for i in range(1, len(parts), 2)]
     inputs = page_inputs(src, [p for p, _ in pages])
-    stats = {}
+    stats, merge = {}, threading.Lock()
 
     def one(k):
         jpeg, layer = inputs[pages[k][0]]
-        return k, audit_page(pages[k][1], jpeg, layer if use_layer else "", llm_url, model, stats, sizes)
+        text = pages[k][1]
+        st, t0, steps, changed = {}, time.time(), [], {}   # this page's own counts, merged into stats at its end
+        before = [text]
+
+        def note(step):                               # lines each step changed on this page (trace): which step did what
+            a, b = set(before[0].split("\n")), set(text.split("\n"))
+            changed[step] = len(a ^ b)
+            before[0] = text
+        do_inspect, do_lines, do_audit, do_enhance, page_sizes = inspect, line_review, True, enhance, sizes
+        page_skip, level = skip_settled, None
+        if triage:                                    # standard: the page's own text, else one short look, picks its passes
+            lay = layer if use_layer else ""
+            if quiet_page(text, lay, ((trace or {}).get(str(pages[k][0])) or {}).get("layout")):
+                tri, level, why = None, "none", "settled by the page's text, text blocks only"
+            else:
+                tri = triage_page(jpeg, llm_url, model)
+                steps.append("triage")
+                level, why = page_level(tri, text, lay)
+            st[f"page level: {level}"] = 1
+            if decisions is not None:
+                decisions[pages[k][0]] = {"level": level, "why": why, "page": tri}
+            p = PAGE_LEVELS[level]
+            do_inspect, do_lines, do_audit, do_enhance = p["INSPECT"], 0, p["AUDIT"], False
+            page_sizes = tuple(p["AUDIT_SECTIONS"])
+        if do_inspect:                                # every element questioned first, then the line-by-line audit
+            steps.append("inspect")
+            try:
+                count = iter(range(10 ** 6))         # a missing figure's name is unique on its page
+                page_add = (lambda bbox, p=pages[k][0]: add_figure(p, bbox, next(count))) if add_figure else None
+                text = inspect_page(text, jpeg, layer if use_layer else "", llm_url, model, st, page_add)
+            except Exception:
+                st["inspect calls failed"] = st.get("inspect calls failed", 0) + 1
+            note("inspect")
+        if do_lines:                                  # precise: the vision LLM writes the page again a few lines at a time;
+            lay = layer if use_layer else ""          # each part kept only if it loses and invents nothing (else by paragraph)
+            if page_skip and page_settled(text, lay):
+                why = "settled by the text layer"
+            else:
+                steps.append("lines")
+                try:
+                    new, why = review_page(text.strip("\n"), jpeg, lay, llm_url, model, ctx, keep_headers, int(do_lines))
+                    text = new if not why else text
+                except Exception as e:
+                    why = f"failed: {type(e).__name__}"
+            key = "line review: kept draft (" + why.partition("|")[0] + ")" if why else "line review: rewritten"
+            st[key] = st.get(key, 0) + 1
+            note("lines")
+        if do_audit:
+            steps.append("audit")
+            text = audit_page(text, jpeg, layer if use_layer else "", llm_url, model, st, page_sizes)
+            note("audit")
+        if do_enhance:                                   # precise: last, on the checked text: prose written professionally
+            steps.append("enhance")
+            try:
+                text = enhance_page(text, jpeg, llm_url, model, st, layer if use_layer else "")
+            except Exception:
+                st["enhance calls failed"] = st.get("enhance calls failed", 0) + 1
+            note("enhance")
+        counts = {c: v for c, v in st.items() if isinstance(v, int)}
+        with merge:
+            for c, v in counts.items():
+                stats[c] = stats.get(c, 0) + v
+            ex_ = stats.setdefault("examples", []) if st.get("examples") else None
+            if ex_ is not None:
+                ex_ += st["examples"][:max(0, 12 - len(ex_))]
+            if trace is not None:
+                trace.setdefault(str(pages[k][0]), {}).update(   # added to what is there (the worker's layout counts)
+                    dict({"level": level} if level else {}, s=round(time.time() - t0, 1),
+                         steps=steps, changed=changed, layer=bool((layer or "").strip()), **counts))
+        return k, text
     with ThreadPoolExecutor(max(1, concurrency)) as ex:
         for k, text in ex.map(one, [k for k, (p, _) in enumerate(pages) if p in inputs]):
             pages[k][1] = text
@@ -698,35 +1149,58 @@ def audit_pages(md_path, src, llm_url, model, concurrency=2, use_layer=True, siz
     return _public(stats)
 
 
-# ----------------------------------------------------------------- quality: fast / balanced / accurate
+# ----------------------------------------------------------------- quality: express / standard / precise
+# Every mode: Marker + Surya (Surya re-reads more than Marker's defaults; Marker's own LLM steps are never used), figures
+# re-cropped without a model, the text inside pictures read by Surya, and every fix that needs no model (text layer, Indic
+# order, tables against the image, drawn formulas, outline headings, tidy-up). The modes differ only in what the vision LLM
+# (Qwen3-VL-8B) does on top. Block labels by the vision LLM (LABEL_BLOCKS) only feed the trace and --show-layout: they never
+# change the Markdown, so no mode pays for them (--labels / --show-layout ask for them; they made the old fast mode 50%
+# slower on the 104-page scan subset: 1550 s -> 2333 s).
+_BASE = dict(MARKER_LLM=False, REDO_INLINE_MATH=False, PAGE_REVIEW=False, REVIEW_PART_TOKENS=0, REVIEW_SKIP_SETTLED=True,
+             TRANSCRIBE_TEXT_IMAGES=False, OCR_PICTURES=True, LABEL_BLOCKS=False,
+             # no Marker LLM steps behind it: Surya re-reads more (Marker's defaults in brackets)
+             MARKER_EXTRA=dict(min_recon_score=0.85,                # tables: below this the PDF text's table is re-read (0.75)
+                               inline_math_min_unicode_frac=0.01,   # a block with this share of maths characters is re-read (0.02)
+                               inline_math_doc_ratio=0.2,           # this share of maths blocks: every text block re-read (0.3)
+                               block_garbled_check_min_page_score=0.03, min_garbled_text_chars=30),   # garbled text (0.05, 50)
+             DESCRIBE_FIGURES=False, CORE_CROP=False, GRAPH_TRIES=0, GRAPH_CHECKS=0,
+             TRIAGE=False, AUDIT=False, AUDIT_SECTIONS=(0,), INSPECT=False, LINE_REVIEW_TOKENS=0, ENHANCE=False)
 QUALITY_PROFILES = {
-    # Marker's own LLM steps (+ its inline-maths rewrite), figure descriptions (crop to the figure, flow-diagram graph
-    # answers/checks), page review (sections of at most N tokens; 0 = the whole page at once), line-by-line audit (paragraphs
-    # per section, one pass per number). Everything without an LLM (tables, drawn formulas, text-layer repair, Indic repair,
-    # tidy-up) runs at every quality.
-    # fast: no Marker LLM steps and no page rewrite (the two big costs); the cheap checks that fix the most stay: figures
-    #       cropped to themselves, one graph read, and a light audit (short answers: only the corrections)
-    "fast": dict(MARKER_LLM=False, REDO_INLINE_MATH=False, DESCRIBE_FIGURES=True, CORE_CROP=True, GRAPH_TRIES=1, GRAPH_CHECKS=0,
-                 PAGE_REVIEW=False, REVIEW_PART_TOKENS=0, REVIEW_SKIP_SETTLED=True, AUDIT=True, AUDIT_SECTIONS=(12,),
-                 TRANSCRIBE_TEXT_IMAGES=False),
-    # balanced: a page its PDF text settles completely is not rewritten (only its formatting could change); a picture that is
-    #       mostly text (a newspaper page, a letter) is transcribed tile by tile, not only described
-    "balanced": dict(MARKER_LLM=True, REDO_INLINE_MATH=False, DESCRIBE_FIGURES=True, CORE_CROP=True, GRAPH_TRIES=2, GRAPH_CHECKS=2,
-                     PAGE_REVIEW=True, REVIEW_PART_TOKENS=0, REVIEW_SKIP_SETTLED=True, AUDIT=True, AUDIT_SECTIONS=(8,),
-                     TRANSCRIBE_TEXT_IMAGES=True),
-    # accurate: nothing left out; the review section by section and two audit passes (the second in smaller sections finds
-    #       what the first missed: run 1 of the suite caught 数字李生 but not 音服热线)
-    "accurate": dict(MARKER_LLM=True, REDO_INLINE_MATH=True, DESCRIBE_FIGURES=True, CORE_CROP=True, GRAPH_TRIES=3, GRAPH_CHECKS=2,
-                     PAGE_REVIEW=True, REVIEW_PART_TOKENS=900, REVIEW_SKIP_SETTLED=False, AUDIT=True, AUDIT_SECTIONS=(6, 3),
-                     TRANSCRIBE_TEXT_IMAGES=True),
+    # express: no vision-LLM call at all. Surya's reading goes under each picture. Fastest (as "superfast": 409 pages/h on
+    #       the 104-page scan subset, 57/59 checks on the 27-page suite)
+    "express": dict(_BASE),
+    # standard (default): the vision LLM only where it pays. A page whose every word is the PDF's own text, with only text
+    #       blocks and no picture, gets no call at all (most of a digital book); every other page gets one short triage and
+    #       then the passes of its level (PAGE_LEVELS): plain text one whole-page audit; tables/maths/code/figures/scans/forms
+    #       the element inspection + audit; handwriting and hard pages also a finer audit. Figures are cropped to themselves
+    #       and described by their meaning only on pages with diagrams or charts (Surya's reading as evidence, a Mermaid
+    #       graph only for a flow diagram); elsewhere Surya's reading goes under the picture
+    "standard": dict(_BASE, TRIAGE=True, AUDIT=True, DESCRIBE_FIGURES=True, CORE_CROP=True, GRAPH_TRIES=2, GRAPH_CHECKS=2),
+    # precise: every pass on every page, no triage: the element inspection, a line-by-line rewrite (~600-token parts, each
+    #       kept only if nothing is lost or invented), ONE audit in small sections (3 paragraphs: small sections find what big
+    #       ones miss), then prose made explicit (the author's wording kept below each paragraph); every figure described.
+    #       A page its own text settles (every word the PDF's, no maths/code/table) gets no line pass and no rewrite
+    "precise": dict(_BASE, AUDIT=True, AUDIT_SECTIONS=(3,), INSPECT=True, LINE_REVIEW_TOKENS=600, ENHANCE=True,
+                    DESCRIBE_FIGURES=True, CORE_CROP=True, GRAPH_TRIES=3, GRAPH_CHECKS=2),
 }
+QUALITIES = tuple(QUALITY_PROFILES)          # fastest first
+DEFAULT_QUALITY = "standard"
+# the five names used before 2026-11-26 still work: by what they were for
+QUALITY_ALIASES = {"superfast": "express", "fast": "express", "balanced": "standard", "auto": "standard", "accurate": "precise"}
+
+
+def canonical_quality(q):
+    """a quality's current name (an old name is mapped, case and spaces ignored; None = the default) -> name, or None if unknown"""
+    q = str(q or DEFAULT_QUALITY).strip().lower()
+    q = QUALITY_ALIASES.get(q, q)
+    return q if q in QUALITY_PROFILES else None
 
 
 def quality_option(opts, key):
     """an option as the job's quality sets it, unless the job sets it itself"""
     if opts.get(key) is not None:
         return opts[key]
-    return QUALITY_PROFILES.get(str(opts.get("QUALITY") or "balanced").lower(), QUALITY_PROFILES["balanced"])[key]
+    return QUALITY_PROFILES[canonical_quality(opts.get("QUALITY")) or DEFAULT_QUALITY][key]
 
 
 # ----------------------------------------------------------------- LLM answers in JSON that carry LaTeX
@@ -1033,6 +1507,22 @@ def _table_pipes(seg):
     return "\n".join(row(l) for l in seg.split("\n"))
 
 
+TEXT_GREEK = re.compile(r"\\text\{(" + "|".join(sorted({"alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta",
+    "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu", "xi", "pi", "rho", "sigma", "tau", "upsilon", "phi",
+    "varphi", "chi", "psi", "omega", "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi",
+    "Omega"}, key=len, reverse=True)) + r")\}")
+MATH_SPAN = re.compile(r"\$\$.+?\$\$|(?<![\\$])\$[^$\n]+?\$", re.S)
+
+
+def greek_in_maths(seg):
+    """a page that prints Greek letters as words ("lambda_3", "theta") is OCR'd as \\text{lambda}_3: inside maths a Greek
+    letter's name is that letter (\\lambda_3). Prose is never touched"""
+    def letter(g):                                            # \text{lambda}x -> \lambda x, not the unknown \lambdax
+        nxt = g.string[g.end():g.end() + 1]
+        return "\\" + g.group(1) + (" " if nxt.isalpha() else "")
+    return MATH_SPAN.sub(lambda m: TEXT_GREEK.sub(letter, m.group(0)), seg)
+
+
 def _prose(seg):
     """the clean-ups that must never touch code"""
     seg = "\n".join(re.sub(r'<math[^>]*>(.*?)</math>', lambda m: f"${m.group(1).strip()}$", l) if l.lstrip().startswith("|") else l
@@ -1044,7 +1534,7 @@ def _prose(seg):
     seg = STALE_NUMBER.sub(r"\1", seg)                                          # "1. 2. item" -> "2. item" (the page's number)
     seg = _table_pipes(seg)
     seg = re.sub(r"(?m)^([ \t]*)\$\$([^$\n]+?)(?<![\\$])\$[ \t]*$", r"\1$$\2$$", seg)   # "$$ x = y $": closed as display maths
-    seg = _tag_numbers(_html_bits(seg))
+    seg = greek_in_maths(_tag_numbers(_html_bits(seg)))
     seg = re.sub(r"^(\s*)(?:[-*+]\s+)?(?:\[([ xX✓✔])\]|([☐☑☒✅]))\s+",          # "[X] Step 1" / "☐ item" -> GFM task list
                  lambda m: f"{m.group(1)}- [{'x' if (m.group(2) or '').strip() or (m.group(3) or '') in '☑☒✅' and m.group(3) else ' '}] ", seg, flags=re.M)
     seg = "\n\n".join(_hard_breaks(x) for x in seg.split("\n\n"))
@@ -1089,11 +1579,38 @@ def _no_loops(seg):
     return "\n\n".join(res)
 
 
+FENCE_LINE = re.compile(r"^[ \t]*(```|~~~)[ \t]*([\w+#.-]*)[ \t]*$")
+
+
+def join_split_code(md):
+    """one listing the layout model cut into code blocks with nothing but blank lines between them (benchmark: 7 of 38
+    blocks; one cut right after "void main() {") becomes one block again. Only when the next block has no language or the
+    same one; a block after any text, or on the next page, stays apart"""
+    lines, out, i, fence, lang = md.split("\n"), [], 0, None, ""
+    while i < len(lines):
+        m = FENCE_LINE.match(lines[i])
+        if m and fence and m.group(1) == fence and not m.group(2):              # a closing fence
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            nxt = FENCE_LINE.match(lines[j]) if j < len(lines) else None
+            if nxt and nxt.group(1) == fence and nxt.group(2) in ("", lang) and j - i <= 3:
+                i = j + 1                                                         # close, blanks, reopen: dropped
+                continue
+            fence = None
+        elif m and not fence:
+            fence, lang = m.group(1), m.group(2)
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def tidy(md):
     """valid, readable Markdown: <math> tags as $/$$, money not read as maths, blank lines around headings, tables,
     display math and code, every code fence closed, no runs of blank lines, broken paragraphs joined. Code is left as is."""
     md = re.sub(r"<\|\d{1,6}\|>", "", md)                      # the OCR model's own tokens (<|713|>), even inside code
     md = INDIC_SPLIT.sub("", md)                                # "ঢাক ার": a vowel sign never starts a word
+    md = join_split_code(md)
     md = "".join(seg if k % 2 else _prose(seg) for k, seg in enumerate(CODE_BLOCK.split(md)))
     md = join_broken(md)
     md = "".join(seg if k % 2 else _no_loops(seg) for k, seg in enumerate(CODE_BLOCK.split(md)))

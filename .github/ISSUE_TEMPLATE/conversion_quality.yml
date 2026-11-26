@@ -26,7 +26,7 @@ body:
     id: quality
     attributes:
       label: Quality mode
-      options: [balanced (default), fast, accurate, several / all]
+      options: [standard (default), express, precise, several / all]
     validations:
       required: true
   - type: input

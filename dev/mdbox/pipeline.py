@@ -9,6 +9,7 @@ from pathlib import Path
 
 import convert
 import review as R
+import spreads
 
 HERE = Path(__file__).resolve().parent
 WORKER_PY = Path(os.environ.get("MD_WORKER_PY") or HERE / "worker.py")
@@ -18,9 +19,11 @@ DOC_EXT = convert.ALL_EXT
 # WORKERS 0 = from the vCPUs and free RAM (WORKERS_PER_CPU, MEM_PER_WORKER_GB); VLM_PARALLEL 0 = from VLM_SLOTS
 DEFAULTS = dict(WORKERS=0, CPU_THREADS=0, VLM_URL="", VLM_PARALLEL=0, VLM_SLOTS=0, MODE="auto", OFFICE="pdf", DOC_TIMEOUT_MIN=90,
                 LLM_URL="", LLM_MODEL="", LLM_SLOTS=0, USE_LLM=False, REDO_INLINE_MATH=None, DESCRIBE_FIGURES=None, PAGE_REVIEW=None, LLM_CTX=8192,
-                QUALITY="balanced",                           # fast / balanced / accurate (review.QUALITY_PROFILES); None above = as the quality sets it
+                QUALITY="standard",                           # express / standard / precise (review.QUALITY_PROFILES); None above = as the quality sets it
                 TIME_BUDGET_H=7.0, MAX_ZIP_FILES=2000, MAX_UNZIPPED_GB=6.0,
                 SPLIT_MIN_PAGES=8, CHUNK_MIN_PAGES=4, CHUNK_MAX_PAGES=24,
+                CHUNK_ROUNDS=2,                               # chunks per worker: more = smaller chunks, a shorter tail, more per-chunk work
+                SPLIT_SPREADS=True,                           # two facing book pages in one photo or scan: cut in two before OCR (spreads.py)
                 MEM_PER_WORKER_GB=3.0, MEM_RESERVE_GB=3.0,     # RAM a Marker worker may need (measured: ~2 GB at its peak in the suite runs) / keep free for the API, tunnel, page cache
                 MEM_PAUSE_FREE_GB=4.0, MEM_RESUME_FREE_GB=6.0, MEM_KILL_FREE_GB=2.0,   # free RAM: stop new pieces / start again / stop a worker
                 MEM_GPU_SERVER_MAX_GB=5.0,                    # a llama-server bigger than this (healthy: ~2.3 + its prompt cache) is restarted when RAM runs out
@@ -28,7 +31,10 @@ DEFAULTS = dict(WORKERS=0, CPU_THREADS=0, VLM_URL="", VLM_PARALLEL=0, VLM_SLOTS=
                 WORKERS_PER_CPU=1.5,                          # workers per vCPU at most (RAM permitting): a worker waiting on the GPUs leaves its CPU free
                 MEM_START_GB=2.5, START_WINDOW_S=60)          # RAM a piece grows by in its first minute; how long a start counts against the free RAM
 DEFAULTS.update(json.loads(os.environ.get("MD_DEFAULTS") or "{}"))      # set from the notebook's JOB_DEFAULTS
-MODES = ("auto", "no_ocr", "fast", "balanced", "vllm")
+DEFAULTS["QUALITY"] = R.canonical_quality(DEFAULTS["QUALITY"]) or R.DEFAULT_QUALITY   # an old name (balanced...) in a notebook
+MODES = ("auto", "no_ocr", "fast", "balanced", "vllm")      # Marker's layout/OCR modes (--mode), not the qualities
+CRASH_WINDOW_S = 600    # unplanned worker deaths are counted over this long: a box that runs for hours (damaged files, one
+                        # crash each) never runs out of restarts, but a crash loop stops within minutes
 
 
 class Cancelled(Exception):
@@ -118,11 +124,13 @@ def rss(pid):
 class Pool:
     def __init__(self, root=None):
         self.dir = Path(root or os.environ.get("MD_POOL") or TMP_ROOT / "md_pool")
-        self.procs, self.seq, self.restarts, self.broken = {}, 0, 0, False
+        self.procs, self.seq, self.broken = {}, 0, False
         self.requeued, self.mem_events = {}, []           # tid -> times put back after a memory kill; notes for the job report
         self.vlm_url, self.parallel, self.threads = "", 8, 2
         self.mtx, self.seq_lock = threading.Lock(), threading.Lock()
         self.planned, self.last_kill = set(), 0.0           # workers stopped or restarting on purpose
+        self.crashes, self.crash_budget, self.parked = [], 3, set()   # unplanned deaths (times) in CRASH_WINDOW_S, how many
+                                                            # it may hold, workers left down until it clears
 
     @property
     def vlm_ok(self):
@@ -132,7 +140,7 @@ class Pool:
         shutil.rmtree(self.dir, ignore_errors=True)
         for d in ("tasks", "results", "running", "logs", "cancel"):
             (self.dir / d).mkdir(parents=True, exist_ok=True)
-        self.vlm_url, self.parallel, self.threads, self.restarts = vlm_url or "", parallel, threads, 3 * n + 3
+        self.vlm_url, self.parallel, self.threads, self.crash_budget = vlm_url or "", parallel, threads, 3 * n + 3
         for k in range(n):
             self.launch(f"w{k}")
 
@@ -147,6 +155,25 @@ class Pool:
         for p in self.procs.values():
             if p.poll() is None:
                 p.terminate()
+
+    @staticmethod
+    def kill(p):
+        """SIGKILL and reap; a process stuck in the kernel is reaped later by maintain() (it must not stop the caller)"""
+        p.kill()
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def forget(self, tids, job_id=None):
+        """a finished job's files in the queue: every idle worker scans tasks/ a few times a second, so over a session they
+        must not pile up"""
+        for tid in tids:
+            for f in (f"tasks/{tid}.json", f"tasks/{tid}.claim", f"running/{tid}.json", f"results/{tid}.json"):
+                (self.dir / f).unlink(missing_ok=True)
+            self.requeued.pop(tid, None)
+        if job_id:
+            (self.dir / "cancel" / job_id).unlink(missing_ok=True)
 
     def enqueue(self, task):
         with self.seq_lock:
@@ -237,11 +264,18 @@ class Pool:
         if free_gb >= float(d["MEM_KILL_FREE_GB"]) or time.time() - self.last_kill < 20:   # give the kernel time to free the last one
             return free_gb
         why = f"memory nearly full ({free_gb:.1f} GB free of {lim / 2 ** 30:.0f} GB)"
-        busy = [(rss(self.procs[i["wid"]].pid), tid, i["wid"]) for tid, i in self.running().items()
+        running = self.running()
+        busy = [(rss(self.procs[i["wid"]].pid), tid, i["wid"]) for tid, i in running.items()
                 if i["wid"] in self.procs and self.procs[i["wid"]].poll() is None]
         size, tid, wid = max(busy) if busy else (0, None, None)
+        held = {i["wid"] for i in running.values()}
+        idle = [(rss(p.pid), w) for w, p in self.procs.items() if w not in held and w not in self.planned and p.poll() is None]
         grown = [s for s in gpu_servers() if s[0] > float(d.get("MEM_GPU_SERVER_MAX_GB", 4)) * 2 ** 30]
-        if grown and max(grown)[0] > size:                   # a GPU server holds the RAM: restart it rather than lose pieces
+        if idle and max(idle)[0] > max(size, 0.6 * float(d["MEM_PER_WORKER_GB"]) * 2 ** 30):
+            b, w = max(idle)                                 # an idle worker kept a past piece's memory: restart it, no piece lost
+            self.planned.add(w); self.kill(self.procs[w]); self.last_kill = time.time()
+            self.mem_events.append(f"{why}: idle worker {w} held {b / 2 ** 30:.1f} GB; restarted")
+        elif grown and max(grown)[0] > size:                 # a GPU server holds the RAM: restart it rather than lose pieces
             b, pid, name = max(grown)
             try:
                 os.kill(pid, 9); self.last_kill = time.time()
@@ -249,16 +283,16 @@ class Pool:
             except ProcessLookupError:
                 pass
         elif busy:
-            p = self.procs[wid]
-            p.kill(); p.wait(10); self.last_kill = time.time()
+            self.planned.add(wid); self.kill(self.procs[wid]); self.last_kill = time.time()
             # a small worker was not the cause: its piece is redone without counting toward "needs more memory than the box has"
             self.requeue(tid, wid, f"{why}, worker {wid} ({size / 2 ** 30:.1f} GB) stopped",
                          count=size > 0.6 * float(d["MEM_PER_WORKER_GB"]) * 2 ** 30)
-            self.planned.add(wid)
         return free_gb
 
     def maintain(self, doc_timeout_s):
-        """kill workers stuck on a cancelled/over-long document, relaunch crashed workers, release their claims"""
+        """kill workers stuck on a cancelled/over-long document, relaunch crashed workers, release their claims. A worker
+        stopped on purpose (cancel, timeout, memory) is relaunched at once; crashes are budgeted per CRASH_WINDOW_S (a crash
+        loop parks the workers until it clears; broken while all of them are parked)"""
         with self.mtx:
             self.guard_memory()
             now = time.time()
@@ -272,10 +306,11 @@ class Pool:
                 if why:
                     p = self.procs.get(info["wid"])
                     if p and p.poll() is None:
-                        p.kill(); p.wait(10)
+                        self.planned.add(info["wid"]); self.kill(p)    # stopped on purpose: no crash
                     self._fail(tid, task, why, info["wid"])
+            self.crashes = [t for t in self.crashes if now - t < CRASH_WINDOW_S]
             for wid, p in list(self.procs.items()):
-                if p.poll() is None:
+                if p.poll() is None or wid in self.parked:
                     continue
                 planned = wid in self.planned or p.returncode == self.RECYCLED
                 self.planned.discard(wid)
@@ -294,10 +329,15 @@ class Pool:
                         pass
                 if planned:
                     self.launch(wid)                              # restarts on purpose do not use up the crash budget
-                elif self.restarts > 0:
-                    self.restarts -= 1; self.launch(wid)
+                elif len(self.crashes) < self.crash_budget:
+                    self.crashes.append(now); self.launch(wid)
                 else:
-                    self.broken = True
+                    self.parked.add(wid)                          # crashing too often: down until the window clears
+            for wid in list(self.parked):
+                if len(self.crashes) >= self.crash_budget:
+                    break
+                self.parked.discard(wid); self.crashes.append(now); self.launch(wid)   # the window cleared: try again
+            self.broken = bool(self.procs) and self.parked >= set(self.procs)
 
     TQDM = re.compile(r"([A-Za-z][A-Za-z ./()-]{2,40}?):\s+(\d+)%\|[^|]*\|\s*(\d+/\d+)")
 
@@ -384,7 +424,60 @@ def format_pages(pages):
     return ",".join(runs)
 
 
-def plan_chunks(pages, workers, min_pages=10, max_pages=40):
+def page_costs(path, pages):
+    """estimated work per page: 1, plus up to 4 for the share of the page covered by raster images (a scan or a screenshot
+    is OCR'd in full: a dense newspaper page took minutes of Surya decoding while the text pages were done). None if unknown"""
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as raw
+        d = pdfium.PdfDocument(str(path))
+        try:
+            out = []
+            for p in pages:
+                page = d[p]
+                w, h = page.get_size()
+                area = 0.0
+                for obj in page.get_objects(filter=(raw.FPDF_PAGEOBJ_IMAGE,), max_depth=2):
+                    l, b, r, t = obj.get_pos()
+                    area += max(0.0, min(r, w) - max(l, 0)) * max(0.0, min(t, h) - max(b, 0))
+                out.append(1.0 + 4.0 * min(1.0, area / max(1.0, w * h)))
+            return out
+        finally:
+            d.close()
+    except Exception:
+        return None
+
+
+def split_by_cost(pages, costs, k, lo, hi):
+    """k contiguous chunks of lo..hi pages whose largest estimated work is as small as it can be (scan-heavy stretches get
+    fewer pages). Exact: best[j][i] = the smallest possible largest chunk when the first i pages make j chunks; a chunk is
+    at most hi pages, so this is k * n * hi steps. None when the limits allow no k chunks"""
+    n = len(pages)
+    if not (k * lo <= n <= k * hi):
+        return None
+    pre = [0.0]
+    for c in costs:
+        pre.append(pre[-1] + c)
+    INF = float("inf")
+    best = [[INF] * (n + 1) for _ in range(k + 1)]; cut = [[0] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = 0.0
+    for j in range(1, k + 1):
+        for i in range(j * lo, min(n, j * hi) + 1):
+            for s in range(lo, min(hi, i) + 1):
+                prev = best[j - 1][i - s]
+                if prev < INF:
+                    v = max(prev, pre[i] - pre[i - s])
+                    if v < best[j][i]:
+                        best[j][i], cut[j][i] = v, s
+    if best[k][n] == INF:
+        return None
+    out, i = [], n
+    for j in range(k, 0, -1):
+        s = cut[j][i]; out.append(pages[i - s:i]); i -= s
+    return out[::-1]
+
+
+def plan_chunks(pages, workers, min_pages=10, max_pages=40, costs=None, rounds=2):
     """contiguous page chunks, min..max pages long, enough for every worker to get about two, in whole rounds: the count is a
     multiple of the workers (6 chunks on 5 workers left one worker a second round while four waited: the 27-page suite took
     ~1/3 longer than its work), rounded up while every chunk keeps min_pages, and the sizes as even as possible"""
@@ -392,11 +485,15 @@ def plan_chunks(pages, workers, min_pages=10, max_pages=40):
     if n < 2 * min_pages:
         return [pages]
     most = n // min_pages
-    k = max(math.ceil(n / max_pages), min(2 * workers, most))
+    k = max(math.ceil(n / max_pages), min(max(1, int(rounds)) * workers, most))   # rounds: per job (CHUNK_ROUNDS), for tuning
     if workers > 1 and k > workers and k % workers:
         up = math.ceil(k / workers) * workers
         k = up if up <= most else max(workers, k // workers * workers)
     k = max(1, min(k, n))
+    if costs is not None and len(costs) == n and k > 1:
+        by_cost = split_by_cost(pages, costs, k, min_pages, max_pages)
+        if by_cost:
+            return by_cost
     base, extra = divmod(n, k)
     out, at = [], 0
     for i in range(k):
@@ -426,11 +523,28 @@ def chunk_plan(path, opts, workers, o):
     pages = parse_pages(opts.get("PAGE_RANGE"), total or 0)
     if len(pages) < int(o["SPLIT_MIN_PAGES"]):
         return None
-    parts = plan_chunks(pages, workers, int(o["CHUNK_MIN_PAGES"]), int(o["CHUNK_MAX_PAGES"]))
-    return parts if len(parts) > 1 else None
+    costs = page_costs(path, pages)
+    parts = plan_chunks(pages, workers, int(o["CHUNK_MIN_PAGES"]), int(o["CHUNK_MAX_PAGES"]), costs,
+                        int(opts.get("CHUNK_ROUNDS") or o["CHUNK_ROUNDS"]))
+    if opts.get("SPREADS"):                              # a spread's two halves in one chunk: the worker orders and joins them
+        parts = spreads.keep_pairs(parts, opts["SPREADS"])
+    if len(parts) < 2:
+        return None
+    at, weights = 0, []
+    for part in parts:                                   # each chunk's estimated work, for heaviest-first queueing
+        weights.append(sum(costs[at:at + len(part)]) if costs else float(len(part))); at += len(part)
+    return parts, weights
+
+
+def heaviest_first(weights):
+    """the order to queue chunks in: the most work first, so the slowest pieces start at once instead of ending the job
+    alone (the 3-copy load test spent its last ~40% with one or two dense scans decoding and the rest of the box idle)"""
+    return sorted(range(len(weights)), key=lambda k: (-weights[k], k))
 
 
 RENDER_LOCK = threading.Lock()      # one LibreOffice / ddjvu at a time on the box: each can take GBs of RAM
+SPREADS_LOCK = threading.Lock()     # one job at a time looks for spreads (2 processes with Indra, ~0.5 GB each): with 8 jobs
+                                    # starting at once that was 16 processes the memory guard does not see
 
 
 def pre_render(path, i, opts, warnings, note=lambda name: None):
@@ -515,6 +629,10 @@ def safe_extract(zpath, dest, max_files, max_bytes):
 def llm_plan(opts, workers, warnings):
     """which LLM passes a job gets: the box's own vision LLM (LLM_URL) first, else Gemini, else none"""
     d = DEFAULTS
+    q = R.canonical_quality(opts.get("QUALITY") or d["QUALITY"]) or R.DEFAULT_QUALITY
+    if q != "express" and opts.get("USE_LLM") is not False and not d["LLM_URL"]:   # every other quality's passes need it
+        warnings.append(f"quality {q} needs the box's vision LLM, which is not running: this job gets express's steps "   # (none uses
+                        "(no triage, audit, inspection or figure descriptions)")                                         # Gemini)
     have = bool(d["LLM_URL"]) or bool(os.environ.get("GOOGLE_API_KEY"))
     want = opts.get("USE_LLM", bool(d["USE_LLM"]))
     if want and not have:
@@ -577,6 +695,7 @@ class ResourceSampler(threading.Thread):
     def __init__(self, every=2.0):
         super().__init__(daemon=True)
         self.every, self.samples, self.done = every, [], threading.Event()
+        self.low = None                                      # (free GB, biggest processes) at the lowest free RAM: where did it go?
 
     @staticmethod
     def cpu_seconds():
@@ -607,6 +726,8 @@ class ResourceSampler(threading.Thread):
             cpu = 100 * (c - last_c) / max(1e-6, (now - last_t) * cpus) if c is not None and last_c is not None else None
             last_t, last_c = now, c
             self.samples.append((gpus, (lim - used) / 2 ** 30, cpu))
+            if self.low is None or (lim - used) / 2 ** 30 < self.low[0]:
+                self.low = ((lim - used) / 2 ** 30, processes(8))
 
     def summary(self):
         self.done.set()
@@ -619,6 +740,8 @@ class ResourceSampler(threading.Thread):
                "gpu_busy_pct": [round(sum(u) / len(u)) for u in util if u],
                "gpu_mem_max_mb": [max(g[i][1] for g, _, _ in s if len(g) > i) for i in range(n)],
                "ram_free_min_gb": round(min(f for _, f, _ in s), 1)}
+        if self.low:
+            out["ram_at_min"] = [f"{mb / 1024:.1f} GB {name}" for mb, name in self.low[1]]
         cpu = [c for _, _, c in s if c is not None]
         if cpu:
             out["cpu_busy_pct"] = round(sum(cpu) / len(cpu))
@@ -649,12 +772,14 @@ def run_job(job, opts, session_deadline, upd, cancelled):
     task_opts = {k: v for k, v in (opts or {}).items() if k != "MODE"}
     task_opts["MODE"] = mode
     task_opts["OFFICE"] = (opts or {}).get("OFFICE") or o["OFFICE"]
-    task_opts["QUALITY"] = str((opts or {}).get("QUALITY") or o["QUALITY"]).lower()
-    if task_opts["QUALITY"] not in R.QUALITY_PROFILES:
-        warnings.append(f"unknown quality {task_opts['QUALITY']!r}: balanced used"); task_opts["QUALITY"] = "balanced"
+    asked = (opts or {}).get("QUALITY") or o["QUALITY"]
+    task_opts["QUALITY"] = R.canonical_quality(asked)        # the current name (an old one is mapped): reports and traces agree
+    if task_opts["QUALITY"] is None:
+        warnings.append(f"unknown quality {asked!r}: {R.DEFAULT_QUALITY} used"); task_opts["QUALITY"] = R.DEFAULT_QUALITY
     llm = llm_plan(opts or {}, max(1, len(POOL.procs)), warnings)
     task_opts.update(llm)
     used, out_rel, doc_dirs, chunks = set(), {}, {}, {}      # chunks: doc index -> [(tid, pages)]
+    split_docs, turned_docs = {}, {}                          # doc index -> spreads cut in two / pages turned upright
     workers = max(1, len(POOL.procs))
     for i, (path, rel) in enumerate(docs):
         rel_dir, stem = str(Path(rel).parent) if Path(rel).parent != Path(".") else "", Path(rel).stem
@@ -665,16 +790,37 @@ def run_job(job, opts, session_deadline, upd, cancelled):
         out_rel[i] = str(out_dir.relative_to(out)).replace(os.sep, "/")
         doc_dirs[i] = (out_dir, folder)
         path = pre_render(path, i, task_opts, warnings, lambda name: upd("preparing", 2, f"rendering {name} to PDF"))
-        t = {"job": job["id"], "doc": i, "src": str(path), "rel": rel, "stem": folder, "out": str(out_dir), "out_rel": out_rel[i], "opts": task_opts}
-        plan = chunk_plan(path, task_opts, workers, o)
+        doc_opts = task_opts
+        if (opts or {}).get("SPLIT_SPREADS", o["SPLIT_SPREADS"]) and str(path).lower().endswith(".pdf") \
+                and task_opts.get("OUTPUT_FORMAT", "markdown") == "markdown":
+            upd("preparing", 2, f"turning scanned pages upright and looking for two-page photos in {rel}")
+            try:                                      # a turned scan set upright, two facing pages in one photo cut in two (the
+                want = parse_pages(task_opts.get("PAGE_RANGE"), pdf_pages(path) or 0)        # OCR misses and repeats lines)
+                with SPREADS_LOCK:
+                    new, page_map, turned = spreads.split_spreads(path, Path(path).parent / f".spreads_{i}.pdf", set(want),
+                                                                  workers=2)    # 2: each process loads Indra (~0.5 GB)
+            except Exception as e:
+                warnings.append(f"{rel}: preparing the scanned pages failed ({type(e).__name__}: {str(e)[:120]}); pages read as they are")
+                page_map, turned = None, 0
+            if page_map:
+                path, split_docs[i] = new, len(page_map) - len(set(page_map))
+                turned_docs[i] = turned
+                doc_opts = dict(task_opts, SPREADS=page_map)
+                if task_opts.get("PAGE_RANGE"):
+                    doc_opts["PAGE_RANGE"] = format_pages(spreads.pages_for(page_map, want))
+        t = {"job": job["id"], "doc": i, "src": str(path), "rel": rel, "stem": folder, "out": str(out_dir), "out_rel": out_rel[i], "opts": doc_opts}
+        plan = chunk_plan(path, doc_opts, workers, o)
         if not plan:
             tids[POOL.enqueue(t)] = i
             continue
-        for k, part in enumerate(plan):
-            pages = format_pages(part)
-            tid = POOL.enqueue(dict(t, out=str(out_dir / ".chunks" / f"{k:04d}"), opts=dict(task_opts, PAGE_RANGE=pages)))
-            tids[tid] = i; chunks.setdefault(i, []).append((tid, pages))
-    STEALABLE[job["id"]] = [tid for c in chunks.values() for tid, _ in c]
+        plan, weights = plan
+        placed = [None] * len(plan)                       # kept in page order for the join; queued heaviest first
+        for k in heaviest_first(weights):
+            pages = format_pages(plan[k])
+            tid = POOL.enqueue(dict(t, out=str(out_dir / ".chunks" / f"{k:04d}"), opts=dict(doc_opts, PAGE_RANGE=pages)))
+            tids[tid] = i; placed[k] = (tid, pages)
+        chunks[i] = placed
+    STEALABLE[job["id"]] = [tid for d, c in chunks.items() if d not in split_docs for tid, _ in c]   # the client's copy is not cut
     n = len(docs)
     n_tasks = len(tids)
     results, last_msg, expired = {}, 0, False
@@ -703,7 +849,7 @@ def run_job(job, opts, session_deadline, upd, cancelled):
                 done = f"{len(results)}/{n_tasks} parts of {n} documents" if chunks else f"{len(results)}/{n} documents"
                 if (POOL.dir / "pause").exists():
                     done += f" · RAM low ({(_read(str(POOL.dir / 'pause')) or '?')} GB free): one piece at a time"
-                upd("converting", 3 + 92 * len(results) / n_tasks, f"[{mode}] {done} done" + (f" · working on {now_txt}" if now_txt else " · waiting for a free worker"))
+                upd("converting", 3 + 92 * len(results) / n_tasks, f"[{task_opts['QUALITY']}, Marker {mode}] {done} done" + (f" · working on {now_txt}" if now_txt else " · waiting for a free worker"))
             time.sleep(0.4)
         # ---- collect + bundle
         upd("bundling", 96, "writing the report and the zip")
@@ -748,11 +894,25 @@ def run_job(job, opts, session_deadline, upd, cancelled):
                     dskip[k] = dskip.get(k, 0) + v
             if dskip:
                 row["drawn_formulas_skipped"] = dskip
+            pskip = {k: v for x in rs for k, v in (x.get("pictures_skipped") or {}).items()}
+            if pskip:
+                row["pictures_skipped"] = pskip
+            tr = {"chunks": [], "pages": {}, "figures": {}, "pictures": {}}   # per chunk / page / figure: for tuning (dev/bench_score.py)
+            for x in rs:
+                xt = x.get("trace") or {}
+                tr["chunks"] += [dict(c, seconds=x.get("sec"), ok=bool(x.get("ok"))) for c in xt.get("chunks") or []]
+                for key in ("pages", "figures", "pictures"):
+                    tr[key].update(xt.get(key) or {})
+            if tr["chunks"]:
+                row["trace"] = tr
+            levels = {k: v for x in rs for k, v in (x.get("page_levels") or {}).items()}
+            if levels:                                         # standard: the level (passes) each page got
+                row["page_levels"] = dict(sorted(levels.items(), key=lambda kv: int(kv[0])))
             errs = sorted({x["tables_error"] for x in rs if x.get("tables_error")})
             if errs:
                 row["tables_error"] = errs
             audits = [x.get("audit") for x in rs if x.get("audit")]
-            if audits:                                         # accurate: what the line-by-line audit proposed and did
+            if audits:                                         # what the page audit proposed and did
                 total = {}
                 for st in audits:
                     for k, v in st.items():
@@ -763,11 +923,18 @@ def run_job(job, opts, session_deadline, upd, cancelled):
             qs = sorted({x.get("quality") for x in rs if x.get("quality")})
             if qs:
                 row["quality"] = qs[0] if len(qs) == 1 else qs
-            for key in ("tables_realigned", "table_pictures", "drawn_formulas", "layer_fixes"):
+            for key in ("tables_realigned", "table_pictures", "drawn_formulas", "layer_fixes", "pictures_read", "edges_peeled",
+                        "figures_cropped_by_llm", "picture_text_kept", "pictures_ocr_only", "spreads_reordered"):
                 if any(x.get(key) for x in rs):
                     row[key] = sum(x.get(key) or 0 for x in rs)
             if any(x.get("indic_words_fixed") for x in rs):
                 row["indic_words_fixed"] = sum(x.get("indic_words_fixed") or 0 for x in rs)
+            if split_docs.get(i):                              # two-page photos cut in two: the page count is the original's
+                row["spreads_split"] = split_docs[i]
+                if row["pages"]:
+                    row["pages"] -= split_docs[i]
+            if turned_docs.get(i):
+                row["pages_turned"] = turned_docs[i]
             if not row["ok"]:
                 row["error"] = r.get("error")
             else:
@@ -778,10 +945,11 @@ def run_job(job, opts, session_deadline, upd, cancelled):
         resources = sampler.summary()                         # GPU busy %, CPU %, lowest free RAM while this job ran
         for row in per_doc:
             row["box_resources"] = resources
-        report = {"mode": mode, "llm": (o["LLM_MODEL"] or "gemini") if llm.get("USE_LLM") else None, "documents": per_doc, "warnings": warnings,
-                  "wall_s": round(time.time() - t_start), "pages": pages, "resources": resources}
+        report = {"mode": mode, "quality": task_opts["QUALITY"], "llm": (o["LLM_MODEL"] or "gemini") if llm.get("USE_LLM") else None,
+                  "documents": per_doc, "warnings": warnings, "wall_s": round(time.time() - t_start), "pages": pages, "resources": resources}
         (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         bundle = shutil.make_archive(str(jdir / f"{tag}.markdown"), "zip", out)
+        POOL.forget(list(tids), job["id"])                       # every piece has its result: its queue files can go
         n_ok = sum(d["ok"] for d in per_doc)
         return {"mode": mode, "docs": per_doc, "n_ok": n_ok, "n_failed": n - n_ok, "warnings": warnings, "pages": pages, "bundle": bundle,
                 "files": sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file() and p.suffix in (".md", ".json", ".html"))[:200],

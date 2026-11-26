@@ -13,6 +13,7 @@ position) that no figure covers becomes a figure too (_page_N_Picture_9000+k), p
 Markdown when it has one (convert.place_orphan_images), else at the end of its page. On one digital book the layout model
 had missed photos on 107 of 282 pages that have images.
 The core (refine_page) works on plain arrays and boxes in PDF points, so it is tested without Marker (dev/test_pipeline.py)."""
+import json
 import re
 from pathlib import Path
 
@@ -212,8 +213,9 @@ def drop_refs(md, names):
 
 
 # ----------------------------------------------------------------- the Marker side (runs in worker.py)
-def recrop_document(document, src, out_dir, stem):
+def recrop_document(document, src, out_dir, stem, peel=False):
     """returns {"pages", "figures", "merged", "dropped_captions"} counts; files that Marker did not write are left alone"""
+    placed = {}
     from marker.schema import BlockTypes
     from marker.settings import settings
     ext = settings.OUTPUT_IMAGE_FORMAT.lower()
@@ -274,6 +276,9 @@ def recrop_document(document, src, out_dir, stem):
             for name, (x0, y0, x1, y1) in boxes.items():
                 crop = big.crop((int(x0 * kx), int(y0 * ky), int(np.ceil(x1 * kx)), int(np.ceil(y1 * ky))))
                 stats["labels_blanked"] = stats.get("labels_blanked", 0) + blank_labels(crop, (x0, y0, x1, y1), labels, (kx, ky))
+                if peel:                              # no vision LLM to crop to the figure: rules and running headers cut off
+                    crop, n = peel_edges(crop)
+                    stats["edges_peeled"] = stats.get("edges_peeled", 0) + n
                 crop.save(out_dir / name, quality=JPEG_QUALITY, subsampling=0)
             for name in merged:
                 (out_dir / name).unlink(missing_ok=True)
@@ -284,11 +289,15 @@ def recrop_document(document, src, out_dir, stem):
                     if cap:
                         stats["anchors"][name] = cap
             all_merged += list(merged)
+            for name, (x0, y0, x1, y1) in boxes.items():   # where each figure is on its page (0-1): a "missing" one is checked
+                placed[name] = [int(page.page_id), x0 / pw, y0 / ph, x1 / pw, y1 / ph]     # against these
             stats["pages"] += 1; stats["figures"] += len(boxes)
             stats["merged"] += sum(v is not None for v in merged.values()); stats["dropped_captions"] += sum(v is None for v in merged.values())
     finally:
         if pdf is not None:
             pdf.close()
+    if placed:
+        (out_dir / FIGURE_BOXES).write_text(json.dumps(placed), encoding="utf-8")
     md = out_dir / f"{stem}.md"
     if all_merged and md.is_file():
         md.write_text(drop_refs(md.read_text(encoding="utf-8"), all_merged), encoding="utf-8")
@@ -301,13 +310,16 @@ Describe it for a reader who cannot see it, so that nothing it shows is lost. Th
 (a diagram next to another, (a)/(b) parts): describe every one of them, not only the one a caption names. Return JSON with:
 - "parts": first look over the whole image and list every separate figure, diagram, chart, table, photo or panel in it
   (with its label or caption if it has one), one entry each; a single figure gives one entry
-- "kind": one of photo, diagram, schematic, chart, table, code, screenshot, map, text, logo, decoration
+- "kind": one of photo, flowchart, diagram, schematic, chart, table, code, screenshot, map, text, logo, decoration.
+  flowchart = boxes or nodes joined by arrows or lines that show steps, a process, an order or a hierarchy (flowchart, UML
+  activity/state/sequence diagram, workflow, tree, block diagram of a process); schematic = a circuit or wiring diagram;
+  diagram = any other drawing (geometry, a 3D shape, an illustration, a labelled picture)
 - "summary": one or two sentences saying what the figure is and what it shows or explains: its subject and purpose.
   Use the caption and nearby text to name things correctly, but describe only what is visible.
 - "details": everything inside every part, in Markdown, part by part, without repeating the summary:
   - every label, number, unit and value exactly as written (read carefully; the caption and text help with names and spelling);
   - schematic or wiring diagram: each component with its label and value, and what it connects to, following the circuit;
-  - other diagrams and flowcharts: each part with its label, and how the parts are connected or ordered;
+  - flowcharts and other diagrams: each part with its label, and how the parts are connected or ordered;
   - chart or graph: the axes with their ranges and units, and the values of every series;
   - table: a Markdown table with every row and column;
   - code or a program listing: the exact code in a fenced code block with its language;
@@ -351,12 +363,16 @@ def _ask(llm_url, model, im, prompt, max_tokens, schema=None, timeout=900, extra
     return c["message"]["content"] or "", c.get("finish_reason")
 
 
+class CutOff(ValueError):
+    """the answer ran out of max_tokens: the same request (temperature 0) runs out the same way, so only a bigger one helps"""
+
+
 def _ask_image(llm_url, model, img_path, prompt, timeout=900, max_tokens=2000, schema=None):
-    """-> {"kind", "summary", "details"}; raises on failure (the caller retries)"""
+    """-> {"kind", "summary", "details"}; raises on failure (the caller retries), CutOff when the answer did not fit"""
     from review import latex_json_loads                     # LaTeX in JSON loses its backslashes otherwise
     text, finish = _ask(llm_url, model, Image.open(img_path), prompt, max_tokens, schema or FIGURE_SCHEMA, timeout)
     if finish == "length":
-        raise ValueError("cut off")
+        raise CutOff("cut off")
     out = latex_json_loads(text)
     if not isinstance(out, dict) or not str(out.get("summary", "")).strip():
         raise ValueError("no summary")
@@ -389,7 +405,9 @@ GRAPH_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["d
         "edges": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["from", "to", "label"],
                   "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "label": {"type": "string"}}}}}}},
     "links": {"type": "array", "items": {"type": "string"}}}}
-GRAPH_KINDS = ("diagram", "flowchart")             # "kind" values whose image may be a graph of boxes and arrows (not circuits)
+GRAPH_KINDS = ("flowchart",)   # "kind" values whose image is a graph of boxes and arrows. With "diagram" too (benchmark, 104
+                               # pages): 34 figures got the graph's 2 answers + 2 checks, 5 were graphs (UML, waterfall, trees);
+                               # the rest were circuits, photos, 3D shapes the describer called "diagram": half the figure time
 
 
 def _chains(nodes, edges):
@@ -581,6 +599,63 @@ CORE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["no
 CORE_LOST_INK = 0.005        # the core crop may leave out at most this share of the figure's ink that nobody explained
 
 
+def peel_edges(crop, gap_px=6, pad_px=10):
+    """the crop to the figure itself without a vision model (express). Its ink falls into horizontal bands set apart by
+    white strips. At the top and bottom edge, a band that is a rule running clearly wider than the figure under it (a page
+    rule, the bar of a "FIGURE 5.3" tab), or a line of text resting on such a rule (a running header), is not the figure and
+    is cut off. A figure's own frame, axes or fork bars are joined to it by vertical strokes, so they never form a separate
+    band; a table's rule is as wide as the table, so it stays. At most half the height goes. -> (image, bands cut)"""
+    ink = ink_mask(crop)
+    h, w = ink.shape
+    bands = _runs(ink.any(axis=1), gap_px)
+    if len(bands) < 2:
+        return crop, 0
+    def extent(b0, b1):
+        cols = np.flatnonzero(ink[b0:b1].any(axis=0))
+        return (cols[0], cols[-1]) if len(cols) else (0, 0)
+    from scipy import ndimage
+    def solid_extent(b0, b1):                                 # the figure's width, without specks (a leftover of a tab)
+        lab, n = ndimage.label(ink[b0:b1])
+        if not n:
+            return 0, 0
+        sizes = ndimage.sum(np.ones_like(lab), lab, range(1, n + 1))
+        big = np.isin(lab, np.flatnonzero(sizes >= 0.0004 * h * w) + 1)
+        cols = np.flatnonzero(big.any(axis=0))
+        return (cols[0], cols[-1]) if len(cols) else extent(b0, b1)
+    def rule(b, rest):
+        (b0, b1), (x0, x1) = b, extent(*b)
+        if b1 - b0 > max(14, 0.02 * h) or x1 - x0 < 0.5 * w or not rest:
+            return False
+        cx0, cx1 = solid_extent(rest[0][0], rest[-1][1])
+        return x0 < cx0 - 0.03 * w or x1 > cx1 + 0.03 * w      # wider than what it would leave: not the figure's own line
+    def text_line(b):
+        return b[1] - b[0] <= max(60, 0.08 * h)
+    cut, top_limit, bottom_limit = 0, 0, h
+    for side in (0, -1):
+        while True:
+            bs = bands if side == 0 else bands[::-1]
+            if len(bs) >= 2 and rule(bs[0], sorted(bs[1:])):
+                n = 1
+            elif len(bs) >= 3 and text_line(bs[0]) and rule(bs[1], sorted(bs[2:])):
+                n = 2
+            else:
+                break
+            keep = sorted(bs[n:])
+            if keep[-1][1] - keep[0][0] < 0.5 * h:
+                break
+            if side == 0:
+                top_limit = bs[n - 1][1]                      # the padding may not reach back into what was cut
+            else:
+                bottom_limit = bs[n - 1][0]
+            bands, cut = keep, cut + n
+    if not cut:
+        return crop, 0
+    y0, y1 = bands[0][0], bands[-1][1]
+    x0, x1 = solid_extent(y0, y1)                             # specks beside the figure (a tab's leftover) are not kept
+    return crop.crop((max(0, x0 - pad_px), max(top_limit + 1, y0 - pad_px), min(w, x1 + pad_px + 1),
+                      min(bottom_limit, y1 + pad_px + 1))), cut
+
+
 def core_box(ink, fig, not_fig):
     """ink: bool (H, W); fig and not_fig boxes in pixels (the vision LLM's). -> the figure's box snapped to whole ink shapes,
     or None when it would lose ink that is neither in a not_figure box nor a thin rule (the LLM cut real content)"""
@@ -759,8 +834,144 @@ TEXT_KINDS = ("text", "screenshot")
 TEXT_IMAGE_PX = 1000          # a text picture at least this big (long side) is transcribed tile by tile, not only described
 
 
+OCR_PAGE_SEP = re.compile(r"\n*\{\d+\}-{48}\n*")
+OCR_HEX_O = re.compile(r"\bO(?=[0-9A-F]*[0-9])([0-9A-F]{2,})\b")      # OBF2 / OC00: a hex number read with a letter O
+OCR_LABEL = ("> **Figure content:** read from the image by the OCR model (Surya); descriptions and chart values in it are its "
+             "estimates:")
+
+
+def picture_ocr_quote(md, ocr, min_words=8, known=0.8, strict=False):
+    return picture_ocr_check(md, ocr, min_words, known, strict)[0]
+
+
+def picture_ocr_check(md, ocr, min_words=8, known=0.8, strict=False):
+    """the text Surya read inside a picture (express: no vision LLM) as its "Figure content" quote, or None when it adds
+    nothing: under min_words words (a photo, a chart's few ticks), or mostly words the Markdown already has (a screenshot
+    whose text Marker took from the page). strict (a picture the layout found text blocks in: Marker may have output them,
+    or dropped them as part of the figure, like a diagram's labels): at least 40% of its distinct words must be new"""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", OCR_PAGE_SEP.sub("\n\n", ocr or ""))
+    text = OCR_HEX_O.sub(r"0\1", text)                       # memory addresses: 0BF2, not OBF2 (not a word either way)
+    text = re.sub(r"(?m)^#{1,6}\s+(.+)$", lambda m: "**" + m.group(1).strip().strip("*").strip() + "**", text).strip()   # headings inside
+                                                                                   # a picture are not document headings (bold once)
+    words = re.findall(r"\w+", text)
+    if len(words) < min_words:
+        return None, f"only {len(words)} words read"
+    have = {w.lower() for w in re.findall(r"\w+", md)}
+    distinct = {w.lower() for w in words if len(w) > 1}       # by distinct word: a label repeated 20 times is one word
+    new = distinct - have
+    if strict and len(new) < 0.4 * len(distinct):
+        return None, f"text-heavy, {len(new)} of {len(distinct)} words new"   # its text came out of the page already
+    if len(new) < 3 and len(new) < (1 - known) * len(distinct):
+        return None, f"{len(new)} of {len(distinct)} words new"   # nothing the Markdown does not have already
+    lines = re.sub(r"\n{3,}", "\n\n", text).split("\n")
+    return OCR_LABEL + "\n>\n" + "\n".join("> " + ln if ln.strip() else ">" for ln in lines), ""
+
+
+OCR_TEXT_MIN_WORDS = 40      # a picture with this much text (a newspaper page, a letter): its full text kept under the description
+
+
+def append_ocr_text(md, name, ocr):
+    """standard, precise: under a figure's description, the full text Surya read in it (a description summarises a newspaper page;
+    its words must not be lost) -> (md, added)"""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", OCR_PAGE_SEP.sub("\n\n", ocr or ""))
+    text = OCR_HEX_O.sub(r"0\1", text)
+    text = re.sub(r"(?m)^#{1,6}\s+(.+)$", lambda m: "**" + m.group(1).strip().strip("*").strip() + "**", text).strip()
+    if len(re.findall(r"\w+", text)) < OCR_TEXT_MIN_WORDS:
+        return md, False
+    block = re.compile(r"(!\[[^\]]*\]\(" + re.escape(name) + r"\)\n\n> \*\*Figure content:\*\*[^\n]*(?:\n>[^\n]*)*)")
+    m = block.search(md)
+    if not m or "**Text in the image" in m.group(1):
+        return md, False
+    lines = re.sub(r"\n{3,}", "\n\n", text).split("\n")
+    extra = "\n>\n> **Text in the image** (read by the OCR model):\n>\n" + "\n".join("> " + ln if ln.strip() else ">" for ln in lines)
+    return md[:m.end()] + extra + md[m.end():], True
+
+
+FIGURE_BOXES = ".figure_boxes.json"   # {figure file: [page, x0, y0, x1, y1] on a 0-1 scale}, written by recrop_document
+
+
+def overlaps_known_figure(out_dir, page_id, box):
+    """the name of a figure already on this page that the box covers or sits in (half of the smaller one), else None.
+    Suite run: 8 "missing" figures were all figures already there, cropped with the page header or around the whole scan"""
+    try:
+        placed = json.loads((Path(out_dir) / FIGURE_BOXES).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    x0, y0, x1, y1 = box
+    for name, (p, a0, b0, a1, b1) in placed.items():
+        if int(p) != int(page_id):
+            continue
+        inter = max(0.0, min(x1, a1) - max(x0, a0)) * max(0.0, min(y1, b1) - max(y0, b0))
+        smaller = min((x1 - x0) * (y1 - y0), (a1 - a0) * (b1 - b0))
+        if smaller > 0 and inter >= 0.5 * smaller:
+            return name
+    return None
+
+
+def crop_missing_figure(src, page_id, bbox, out_dir, k, min_px=150):
+    """inspection: a figure the vision LLM saw on the page but the Markdown has none of -> its file name, or (None, why).
+    bbox: [x0, y0, x1, y1] on a 0-1000 scale of the page. The crop is snapped to its ink; it must hold enough ink and must not
+    be a figure of this page that is already there (compared with each of them, small and grey)"""
+    import pypdfium2 as pdfium
+    if len(bbox or []) != 4:
+        return None, "no box"
+    x0, y0, x1, y1 = (max(0.0, min(1000.0, float(v))) for v in bbox)
+    if x1 - x0 < 30 or y1 - y0 < 30:
+        return None, "box too small"
+    known = overlaps_known_figure(out_dir, page_id, (x0 / 1000, y0 / 1000, x1 / 1000, y1 / 1000))
+    if known:
+        return None, f"already there ({known})"
+    doc = pdfium.PdfDocument(str(src))
+    try:
+        page = doc[int(page_id)].render(scale=CROP_DPI / 72).to_pil().convert("RGB")
+    finally:
+        doc.close()
+    w, h = page.size
+    crop = page.crop((int(x0 * w / 1000), int(y0 * h / 1000), int(x1 * w / 1000), int(y1 * h / 1000)))
+    ink = ink_mask(crop)
+    if ink.mean() < 0.01:
+        return None, "no ink there"
+    ys, xs = np.nonzero(ink)
+    crop = crop.crop((max(0, xs.min() - 12), max(0, ys.min() - 12), min(crop.width, xs.max() + 13), min(crop.height, ys.max() + 13)))
+    if min(crop.size) < min_px:
+        return None, "too small"
+    small = lambda im: np.asarray(im.convert("L").resize((48, 48)), dtype=np.float32)
+    mine = small(crop)
+    for old in Path(out_dir).glob(f"_page_{int(page_id)}_*.jpeg"):
+        try:
+            with Image.open(old) as im:
+                if np.abs(small(im) - mine).mean() < 14:
+                    return None, f"already there ({old.name})"
+        except Exception:
+            continue
+    name = f"_page_{int(page_id)}_Picture_{9500 + int(k)}.jpeg"
+    crop.save(Path(out_dir) / name, quality=JPEG_QUALITY, subsampling=0)
+    return name, ""
+
+
+def ocr_pages(markdown):
+    """Marker's paginated Markdown ("{3}" + 48 dashes before each page) -> {page number: its text}"""
+    parts = re.split(r"\n*\{(\d+)\}-{48}\n*", "\n" + (markdown or ""))
+    return {int(parts[i]): parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+
+
+def add_picture_text(md, name, ocr, strict=False):
+    """-> (md, added): the OCR quote right under the picture's link, unless it has a Figure content quote already"""
+    quote = picture_ocr_quote(md, ocr, strict=strict)
+    link = re.compile(r"(!\[[^\]]*\]\(" + re.escape(name) + r"\))(?!\n\n> \*\*Figure content)")
+    if not quote or not link.search(md):
+        return md, False
+    return link.sub(lambda m: m.group(1) + "\n\n" + quote, md, count=1), True
+
+
+OCR_HINT = """
+What an OCR model read inside this figure (it can be wrong, incomplete or out of order: use it to get labels, names and values
+exactly right, and check everything against the image; explain what the figure MEANS, not only what is written in it):
+{text}"""
+
+
 def describe_figures(md_path, img_dir, llm_url, model, concurrency=2, text_heavy=None, tighten=True, graph_tries=3,
-                     graph_checks=2, defer=False, transcribe_text=False):
+                     graph_checks=2, defer=False, transcribe_text=False, hints=None, pages=None, trace=None):
     """adds under each linked figure (once) what it shows and what is in it, written by the vision LLM from the image, its
     caption and the text around it; returns how many it described. tighten: crop each figure to itself first (one call);
     graph_tries/graph_checks: answers and missing-arrow checks for a flow diagram. defer=True: the Markdown is not written
@@ -771,6 +982,8 @@ def describe_figures(md_path, img_dir, llm_url, model, concurrency=2, text_heavy
     md = md_path.read_text(encoding="utf-8")
     names = [n for n in dict.fromkeys(IMG_LINK.findall(md)) if (img_dir / n).is_file()
              and not re.search(r"(?m)^\|.*\]\(" + re.escape(n) + r"\)", md)]      # a picture in a table cell: a quote would break the table
+    if pages is not None:                   # standard: only the figures on pages that need their meaning explained
+        names = [n for n in names if (m := re.match(r"_page_(\d+)_", n)) and int(m.group(1)) in pages]
     names = [n for n in names if not re.search(re.escape(f"]({n})") + r"\s*\n+" + re.escape(DESC_MARK), md)
              and not re.search(r"!\[[^\]]+\]\(" + re.escape(n) + r"\)", md)]        # a logo already named in its alt text
     same, todo = {}, []                     # identical images (a repeated icon or logo) are described once
@@ -788,29 +1001,47 @@ def describe_figures(md_path, img_dir, llm_url, model, concurrency=2, text_heavy
 
     text_heavy = text_heavy or {}
 
-    from concurrent.futures import ThreadPoolExecutor as _Pool
-    graphs = _Pool(max(1, concurrency))     # a figure's graph is read while it is cropped and described (it needs neither)
+    import time
 
     def one(n):
+        t0, note = time.time(), {"cut": 0, "failed": 0, "graph": False}   # trace: what this figure cost and was
+        try:
+            return _one(n, note)
+        finally:
+            if trace is not None:
+                trace[n] = dict(note, s=round(time.time() - t0, 1))
+
+    def _one(n, note):
         wide = (img_dir / n).read_bytes()   # the graph is read better with some room around it (Fig 5.3: right order 4/4, not 0/4)
         ctx = _context(md, n)
-        early = graph_tries and "_Diagram_" in n          # Marker's layout called it a diagram: likely boxes and arrows
-        graph = graphs.submit(ask_graph, llm_url, model, wide, ctx, graph_tries, graph_checks) if early else None
         if tighten:
             try:                            # the figure alone: no caption, label tab, page header or rule in the picture
                 tighten_figure(img_dir / n, llm_url, model)
             except Exception:
                 pass
         prompt = DESCRIBE_PROMPT.format(context=_context(md, n)) + (TEXT_HEAVY_NOTE if n in text_heavy else "")
-        for tokens in (2000, 2000, 4000):   # a failed or cut-off answer is asked again (never skipped silently)
+        if (hints or {}).get(n):                    # Surya's reading of the figure, as evidence for the description
+            prompt += OCR_HINT.format(text=re.sub(r"!\[[^\]]*\]\([^)]*\)", "", hints[n]).strip()[:3000])
+        budget = [2000, 2000, 4000]         # a failed answer is asked again (never skipped silently) ...
+        while budget:
+            tokens = budget.pop(0)
             try:
                 d = _ask_image(llm_url, model, img_dir / n, prompt, max_tokens=tokens)
-            except Exception:
+            except CutOff:                  # ... a cut-off one only with more room
+                note["cut"] += 1
+                budget = [b for b in budget if b > tokens]
                 continue
-            if d["kind"].lower() in GRAPH_KINDS:
-                words, mermaid = graph.result() if graph is not None else \
-                    (ask_graph(llm_url, model, wide, ctx, graph_tries, graph_checks) if graph_tries else ("", ""))
-                if words:                   # boxes and arrows read on their own: the structure is exact, not retold
+            except Exception:
+                note["failed"] += 1
+                continue
+            note["kind"] = d["kind"].lower()
+            if d["kind"].lower() in GRAPH_KINDS:    # the graph is read only now the figure is known to be one. Read early for
+                                                    # every Marker "Diagram", 15 of 16 such crops of an EEE book (circuits) wasted
+                                                    # 2-3 graph answers and 2 checks each
+                words, mermaid = ask_graph(llm_url, model, wide, ctx, graph_tries, graph_checks) if graph_tries else ("", "")
+                note["graph"] = bool(graph_tries)
+                note["mermaid"] = bool(words)
+                if words:                  # boxes and arrows read on their own: the structure is exact, not retold
                     d["details"], d["mermaid"] = words, mermaid
                     try:                        # and the summary says the same (it was written before the graph was read)
                         s = _ask_image(llm_url, model, img_dir / n, DESCRIBE_PROMPT.format(
@@ -832,6 +1063,7 @@ def describe_figures(md_path, img_dir, llm_url, model, concurrency=2, text_heavy
                     pass
             return n, d
         # still too long (a newspaper page in one picture): a short summary, and its text read tile by tile
+        note["summary_only"] = True
         try:
             d = _ask_image(llm_url, model, img_dir / n, prompt + "\nOnly \"kind\" and \"summary\" this time: no details.",
                            max_tokens=600, schema=SUMMARY_SCHEMA)
@@ -842,7 +1074,6 @@ def describe_figures(md_path, img_dir, llm_url, model, concurrency=2, text_heavy
         return n, d
     with ThreadPoolExecutor(max(1, concurrency)) as ex:
         first = {n: d for n, d in ex.map(one, todo) if d}
-    graphs.shutdown(wait=False, cancel_futures=True)          # graphs of figures that were not diagrams: not needed
     got = {m: first[n] for ns in same.values() for n in ns[:1] if n in first for m in ns}
     for ns in same.values():                # the same picture elsewhere gets the same (tightened) crop
         for m in ns[1:]:
@@ -1205,3 +1436,411 @@ def text_coverage(pdf_path, md_text, pages):
         found = sum(w in have for w in words) / len(words)
         out.append({"page": p, "words": len(words), "found": round(found, 3), "low": len(words) >= 20 and found < LOW_COVERAGE})
     return out
+
+
+# ----------------------------------------------------------------- what the layout model found (--show-layout, trace)
+LAYOUT_SKIP = ("Line", "Span", "Char", "Page", "Document", "TableCell", "Reference")   # parts of blocks, not blocks
+LAYOUT_COLORS = {"SectionHeader": (220, 30, 30), "Text": (240, 110, 110), "TextInlineMath": (230, 70, 150), "ListItem": (200, 120, 60),
+                 "Table": (40, 170, 40), "TableOfContents": (40, 140, 90), "Form": (90, 150, 40), "Picture": (240, 170, 20),
+                 "Figure": (240, 170, 20), "Caption": (200, 200, 40), "Footnote": (150, 150, 150), "Equation": (30, 120, 40),
+                 "Code": (40, 90, 220), "Handwriting": (150, 60, 200), "PageHeader": (240, 120, 40), "PageFooter": (240, 120, 40),
+                 "ComplexRegion": (0, 170, 170), "Diagram": (240, 170, 20), "Title": (160, 0, 0), "PageNumber": (240, 120, 40),
+                 "Chart": (200, 140, 0), "Photo": (255, 190, 60), "StampSignature": (120, 0, 120)}
+MISSED = (255, 0, 255)
+
+
+def _covered(lines, boxes):
+    """share of each line's area (x0, y0, x1, y1 rows) inside the boxes"""
+    if not len(lines) or not len(boxes):
+        return np.zeros(len(lines))
+    a, b = np.asarray(lines, dtype=np.float32), np.asarray(boxes, dtype=np.float32)
+    ix = np.clip(np.minimum(a[:, None, 2], b[None, :, 2]) - np.maximum(a[:, None, 0], b[None, :, 0]), 0, None)
+    iy = np.clip(np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1]), 0, None)
+    return (ix * iy).sum(axis=1) / np.maximum(1e-6, (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1]))
+
+
+LABEL_KINDS = ["title", "section_header", "text", "list", "table", "form", "toc", "figure", "photo", "diagram", "chart",
+               "equation", "code", "caption", "footnote", "page_header", "page_footer", "page_number", "handwriting",
+               "stamp_or_signature", "other"]
+# handwriting is asked apart (a yes or no per box): a handwritten equation or heading is both, and asked as one kind the
+# vision LLM named the kind and the handwriting was lost (subset p70, p71, p73-p76 in the first live try)
+QWEN_LABEL = {"title": "Title", "section_header": "SectionHeader", "text": "Text", "list": "ListGroup", "table": "Table",
+              "form": "Form", "toc": "TableOfContents", "figure": "Figure", "photo": "Photo", "diagram": "Diagram",
+              "chart": "Chart", "equation": "Equation", "code": "Code", "caption": "Caption", "footnote": "Footnote",
+              "page_header": "PageHeader", "page_footer": "PageFooter", "page_number": "PageNumber",
+              "handwriting": "Handwriting", "stamp_or_signature": "StampSignature"}
+TEXTISH = {"Text", "ListGroup", "ListItem", "TextInlineMath", "Handwriting", "SectionHeader", "Caption", "Footnote", "Code"}
+PICTUREISH = {"Picture", "Figure", "Diagram", "PictureGroup", "FigureGroup", "ComplexRegion"}
+# what the vision LLM may say about a block of each layout type: a finer class the layout model has none of (title, page
+# number, chart, photo, handwriting, code, stamp) or a text class it confused (a heading read as text). Anything else is a
+# dispute: the layout's type stays and the block is marked for review. Labels never change the block's text.
+ACCEPT = {
+    "text": {"title", "section_header", "list", "equation", "code", "caption", "footnote", "page_header", "page_footer",
+             "page_number", "handwriting", "stamp_or_signature", "table", "form", "toc"},
+    "header": {"title", "section_header", "handwriting"},
+    "furniture": {"page_header", "page_footer", "page_number"},
+    "picture": {"figure", "photo", "diagram", "chart", "handwriting", "stamp_or_signature", "table"},
+    "table": {"table", "form", "toc"},
+    "equation": {"equation", "handwriting"},
+}
+
+
+def _family(t):
+    if t == "SectionHeader":
+        return "header"
+    if t in ("PageHeader", "PageFooter"):
+        return "furniture"
+    if t in PICTUREISH:
+        return "picture"
+    if t in ("Table", "TableGroup", "Form", "TableOfContents"):
+        return "table"
+    if t == "Equation":
+        return "equation"
+    return "text" if t in TEXTISH else None
+
+
+def ocr_label(btype, html):
+    """what the OCR's own output says a text block is: "Code" (a listing), "Table", "TextInlineMath", or None"""
+    if btype not in TEXTISH or not html:
+        return None
+    plain = len(re.sub(r"<[^>]+>", "", html).strip())
+    if not plain:
+        return None
+    code = sum(len(re.sub(r"<[^>]+>", "", m)) for m in re.findall(r"<(?:pre|code)[^>]*>(.*?)</(?:pre|code)>", html, re.S))
+    if code >= 0.5 * plain:
+        return "Code"
+    if "<table" in html:
+        return "Table"
+    if "<math" in html and len(re.sub(r"<math.*?</math>|<[^>]+>", "", html, flags=re.S).strip()) > 0:
+        return "TextInlineMath"
+    return None
+
+
+def fuse_label(btype, qwen=None, evidence=None):
+    """-> (label, disputed). The layout model's type, refined by the OCR's own evidence and by the vision LLM's label where
+    that is a finer class it has none of (ACCEPT); a vision-LLM label outside that keeps the layout's type, disputed"""
+    if btype.endswith("Group") and btype not in ("ListGroup",):
+        return btype, False                        # a figure's or table's group: its parts carry the labels
+    fam = _family(btype)
+    label = evidence or btype
+    if not qwen or qwen == "other" or fam is None:
+        return label, False
+    q = QWEN_LABEL.get(qwen)
+    if q is None:
+        return label, False
+    if q == btype or (q == "Figure" and fam == "picture") or (q == "Text" and fam == "text") or (q == "ListGroup" and btype in ("ListGroup", "ListItem")):
+        return label, False                        # the same class
+    if qwen in ACCEPT.get(fam, set()):
+        if evidence and qwen in ("text", "list", "table", "section_header"):
+            return evidence, False                 # the OCR saw code / a table / maths in it: that is more specific
+        return q, False
+    return label, True
+
+
+LABEL_PROMPT = """This document page has numbered boxes drawn on it (red, the number in a red tag at each box's top-left).
+For EVERY number, say what its box holds, one of: """ + ", ".join(LABEL_KINDS) + """.
+title = the page's or document's main title; section_header = a heading inside the page; list = a bulleted or numbered list;
+toc = a table of contents; figure = a picture of another kind; photo = a photograph; diagram = a drawing, flowchart,
+circuit or schematic; chart = a plot or graph of data; code = a program listing; handwriting = handwritten text or
+handwritten working; stamp_or_signature = a stamp, seal or signature; other = none of these.
+Also say for each box whether its content is handwritten (true) or printed or typed (false); a handwritten equation is
+"equation" and handwritten true.
+Answer JSON: {"kinds": [...], "handwritten": [...]} with exactly one entry per box in each, in the order of the numbers."""
+LABEL_PX = 1600
+LABEL_TOKENS = 12          # answer room per box: a kind is 2-5 tokens (with {"n": .., "kind": ..} entries, 14 a box was cut off
+                           # on every page with more than ~9 blocks in the first box run: 92 of 121 pages got no labels)
+
+
+def label_schema(n):
+    """exactly n kinds and n handwritten flags, in box order"""
+    return {"type": "object", "additionalProperties": False, "required": ["kinds", "handwritten"], "properties": {
+        "kinds": {"type": "array", "minItems": n, "maxItems": n, "items": {"type": "string", "enum": LABEL_KINDS}},
+        "handwritten": {"type": "array", "minItems": n, "maxItems": n, "items": {"type": "boolean"}}}}
+
+
+def marked_page(img, boxes):
+    """the page (PIL) with each box (page image pixels) drawn and numbered from 1, as a JPEG for the vision LLM"""
+    import io
+    from PIL import ImageDraw
+    im = img.convert("RGB").copy()
+    k = LABEL_PX / max(im.size)
+    if k < 1:
+        im = im.resize((round(im.width * k), round(im.height * k)), Image.BILINEAR)
+    else:
+        k = 1.0
+    d = ImageDraw.Draw(im)
+    for n, b in enumerate(boxes, 1):
+        x0, y0, x1, y1 = (v * k for v in b)
+        d.rectangle([x0, y0, x1, y1], outline=(230, 0, 0), width=2)
+        tag = str(n)
+        d.rectangle([x0, max(0, y0 - 13), x0 + 8 * len(tag) + 6, max(13, y0)], fill=(230, 0, 0))
+        d.text((x0 + 3, max(0, y0 - 12)), tag, fill=(255, 255, 255))
+    buf = io.BytesIO(); im.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def ask_labels(img, boxes, llm_url, model):
+    """the vision LLM's label for each box (page image pixels) -> [kind or None], [handwritten: True/False/None]
+    (one short answer for the whole page)"""
+    from review import ask_page, latex_json_loads
+    n = len(boxes)
+    if not n:
+        return [], []
+    ans, fin = ask_page(llm_url, model, marked_page(img, boxes), LABEL_PROMPT, 32 + LABEL_TOKENS * n, schema=label_schema(n),
+                        cache=False)                       # the marked page is sent once: not worth the servers' RAM
+    if fin == "length":
+        return [None] * n, [None] * n
+    got = latex_json_loads(ans)
+    kinds, hand = got.get("kinds") or [], got.get("handwritten") or []
+    pad = lambda xs, ok: [x if ok(x) else None for x in xs[:n]] + [None] * max(0, n - len(xs))
+    return pad(kinds, lambda k: k in LABEL_KINDS), pad(hand, lambda h: isinstance(h, bool))
+
+
+def layout_of(document, out=None, page_map=None, detect=None, labeler=None, workers=1, detected=None):
+    """the layout model's blocks per page -> {page: {type: count, "_lines": text lines, "_lines_outside": lines in no block,
+    "_labels": {label: count}, "_disputed": blocks, "_handwritten": blocks}} (the trace's page profile). Every block type is listed (groups too: on
+    a scan a list's items are its group's text).
+    Labels: each block's type, refined by the OCR's own output (a listing it wrote as code is Code) and, with labeler(page
+    image, boxes) -> ([kind], [handwritten]) (the vision LLM, worker.py), by what the LLM sees in it (fuse_label): code, a title,
+    a page number, a chart or a photo, which the layout model has no class for. The block's text is never changed.
+    detect(gray numpy) -> (text-line boxes, picture boxes) in pixels (Indra's detector): on a page read by OCR, a text line
+    in no block (and not in a picture) is text the layout did not place (digital pages are left out: Marker places those
+    itself). detected: {page: (lines, pictures, image width)} the rescue already found (rescue_missed_text(seen=...)): not
+    detected twice.
+    out: also writes, per page, layout/page_<n>.png (each block drawn with its label, lines in no block in magenta) and
+    page_<n>.json, to see what was found before any mode's work (--show-layout)"""
+    from marker.schema import BlockTypes
+    types = tuple(t for t in BlockTypes if t.name not in LAYOUT_SKIP)
+
+    def one(page):
+        blocks = []
+        for b in page.contained_blocks(document, types):
+            name = str(getattr(b.block_type, "name", b.block_type))
+            top = getattr(b, "top_k", None) or {}
+            blocks.append({"type": name, "bbox": [round(float(v), 1) for v in b.polygon.bbox],
+                           "score": round(float(max(top.values())), 3) if top else None,
+                           "ocr": ocr_label(name, getattr(b, "html", None))})
+        img, lines, missed = None, [], []
+        scanned = getattr(page, "text_extraction_method", None) != "pdftext"
+        known = (detected or {}).get(page.page_id) if scanned else None
+        if (detect is not None and scanned and known is None) or labeler is not None or out is not None:
+            img = page.get_image(highres=True).convert("RGB")
+        if scanned and (known is not None or detect is not None):
+            try:
+                found, pics, width = known if known is not None else (*detect(np.asarray(img.convert("L"))), img.width)
+                k = page.polygon.width / width
+                lines = [[round(float(v) * k, 1) for v in ln[:4]] for ln in found]
+                inside = _covered(lines, [x["bbox"] for x in blocks]) > 0.05
+                if len(pics):
+                    inside |= _covered(lines, [[float(v) * k for v in pc[:4]] for pc in pics]) > 0.2
+                missed = [ln for ln, ok in zip(lines, inside) if not ok]
+            except Exception:
+                lines, missed = [], []
+        qwen, hand = [None] * len(blocks), [None] * len(blocks)
+        if labeler is not None and blocks:
+            k = img.width / page.polygon.width
+            try:
+                qwen, hand = labeler(img, [[v * k for v in x["bbox"]] for x in blocks])
+            except Exception:
+                qwen, hand = [None] * len(blocks), [None] * len(blocks)
+        for x, q, hw in zip(blocks, qwen, hand):
+            x["qwen"] = q
+            x["label"], x["disputed"] = fuse_label(x["type"], q, x["ocr"])
+            x["handwritten"] = bool(hw) or x["label"] == "Handwriting"
+        c = {"_lines": len(lines), "_lines_outside": len(missed), "_labels": {}, "_disputed": sum(x["disputed"] for x in blocks),
+             "_handwritten": sum(x["handwritten"] for x in blocks)}
+        for x in blocks:
+            c[x["type"]] = c.get(x["type"], 0) + 1
+            c["_labels"][x["label"]] = c["_labels"].get(x["label"], 0) + 1
+        if out is not None:
+            draw_layout(page, img, blocks, lines, missed, out, page_map)
+        return page.page_id, c
+
+    if labeler is not None and workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(workers) as ex:
+            return dict(ex.map(one, document.pages))
+    return dict(one(page) for page in document.pages)
+
+
+def draw_layout(page, img, blocks, lines, missed, out, page_map):
+    """--show-layout: layout/page_<n>.png (each block with its fused label; "Text>Code" when it was relabelled, "?" when
+    the vision LLM disagreed; text lines in no block in magenta) and page_<n>.json"""
+    from PIL import ImageDraw
+    d = Path(out) / "layout"; d.mkdir(exist_ok=True)
+    orig = page_map[page.page_id] if page_map and page.page_id < len(page_map) else page.page_id
+    half = ""                                      # a spread's two pages: 81a, 81b (named like the reader counts: from 1)
+    if page_map and page_map.count(orig) > 1:
+        half = "a" if page_map.index(orig) == page.page_id else "b"
+    name = f"page_{orig + 1}{half}"
+    (d / f"{name}.json").write_text(json.dumps({"page_number": f"{orig + 1}{half}", "page": page.page_id, "original_page": orig,
+                                                "size": [page.polygon.width, page.polygon.height],
+                                                "blocks": blocks, "lines": len(lines), "lines_outside": missed},
+                                               ensure_ascii=False), encoding="utf-8")
+    img = img.copy()
+    img.thumbnail((1400, 1400))
+    sx, sy = img.width / page.polygon.width, img.height / page.polygon.height
+    draw = ImageDraw.Draw(img)
+    for ln in missed:
+        draw.rectangle([ln[0] * sx, ln[1] * sy, ln[2] * sx, ln[3] * sy], outline=MISSED, width=3)
+    for x in blocks:
+        col = LAYOUT_COLORS.get(x["label"], LAYOUT_COLORS.get(x["type"], (90, 90, 90)))
+        x0, y0, x1, y1 = x["bbox"]
+        group = x["type"].endswith("Group") and x["type"] != "ListGroup"
+        draw.rectangle([x0 * sx, y0 * sy, x1 * sx, y1 * sy], outline=col, width=1 if group else 2)
+        if group:
+            continue                               # its parts carry the labels
+        label = (x["label"] if x["label"] == x["type"] else f"{x['type']}>{x['label']}") + ("?" if x["disputed"] else "") \
+            + (" hw" if x.get("handwritten") else "")
+        draw.rectangle([x0 * sx, max(0, y0 * sy - 11), x0 * sx + 6 * len(label) + 4, y0 * sy], fill=col)
+        draw.text((x0 * sx + 2, max(0, y0 * sy - 11)), label, fill=(255, 255, 255))
+    if missed:
+        draw.text((6, 6), f"{len(missed)} of {len(lines)} text lines in no block", fill=MISSED)
+    img.save(d / f"{name}.png", optimize=True)
+
+
+# ----------------------------------------------------------------- text the layout left in no block (scans): read it too
+RESCUE_PAD = 0.5           # a rescued region's box grows by this many line heights on each side (descenders, accents,
+                           # a ruled border), up to its neighbours: no text is cut and none is read twice
+RESCUE_EDGE = 0.012        # lines within this share of the image's border are the stack of pages under a photo, not text
+RESCUE_TOKENS = 1024       # OCR answer room per rescued region (a dozen lines)
+RESCUE_READ = 0.6          # a region is text only if Indra's recognizer reads it this sure, and surer than mirrored: the
+                           # subset's "missed" regions were specks, page edges and the other side's print showing through
+                           # (p83 read 0.45 as it stands, 0.67 mirrored); a real missed header line read 0.9 (p35)
+
+
+def readable(engine, gray, box):
+    """True when the region (image pixels) holds text of this page: Indra reads its lines with RESCUE_READ confidence or
+    more, and surer as they stand than mirrored (print showing through from the other side is mirror-written)"""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    crop = np.ascontiguousarray(gray[max(0, y0):y1, max(0, x0):x1])
+    if crop.size == 0:
+        return False
+
+    def conf(a):
+        bx = engine.detect(a)
+        return float(np.mean([c for _, c, _ in engine.recognize(a, bx)])) if len(bx) else 0.0
+    c = conf(crop)
+    return c >= RESCUE_READ and c > conf(np.ascontiguousarray(crop[:, ::-1]))
+
+
+def missed_regions(lines, pics, blocks, size):
+    """text lines (x0, y0, x1, y1 rows, image pixels) in no block and no picture -> padded regions to read, [(box, lines)].
+    Noise is left out: lines at the image's border (the edges of the pages under a photo), lines far from the page's usual
+    line height (a fabric pattern, a frame's ornaments) and shapes that are no line (too short for their height). Lines close
+    above each other in the same column form one region; a region of one short line is left out (a speck)"""
+    W, H = size
+    if not len(lines):
+        return []
+    L = np.asarray(lines, dtype=np.float32)[:, :4]
+    hs = L[:, 3] - L[:, 1]
+    med = float(np.median(hs)) if len(hs) else 0.0
+    inside = _covered(L, blocks) > 0.05
+    if len(pics):
+        inside |= _covered(L, np.asarray(pics, dtype=np.float32)[:, :4]) > 0.2
+    edge = RESCUE_EDGE * max(W, H)
+    keep = [i for i in range(len(L)) if not inside[i]
+            and L[i, 0] > edge and L[i, 1] > edge and L[i, 2] < W - edge and L[i, 3] < H - edge
+            and 0.5 * med <= hs[i] <= 2.5 * med and (L[i, 2] - L[i, 0]) >= 2 * hs[i]]
+    groups = []
+    for i in sorted(keep, key=lambda i: (L[i, 1], L[i, 0])):
+        for g in groups:
+            gb = g["box"]
+            near = L[i, 1] - gb[3] <= 1.5 * med and min(L[i, 2], gb[2]) - max(L[i, 0], gb[0]) > 0
+            if near:
+                g["lines"].append(i)
+                g["box"] = [min(gb[0], L[i, 0]), min(gb[1], L[i, 1]), max(gb[2], L[i, 2]), max(gb[3], L[i, 3])]
+                break
+        else:
+            groups.append({"box": [float(v) for v in L[i]], "lines": [i]})
+    out = []
+    B = np.asarray(blocks, dtype=np.float32).reshape(-1, 4)
+    for g in groups:
+        x0, y0, x1, y1 = g["box"]
+        if len(g["lines"]) < 2 and (x1 - x0) < 0.1 * W:
+            continue
+        pad = RESCUE_PAD * med
+        x0, y0, x1, y1 = max(0.0, x0 - pad), max(0.0, y0 - pad), min(float(W), x1 + pad), min(float(H), y1 + pad)
+        for b in B:                                # the padding stops at a neighbouring block (never overlaps it more)
+            if b[2] <= g["box"][0]:
+                x0 = max(x0, float(b[2])) if b[1] < y1 and b[3] > y0 else x0
+            if b[0] >= g["box"][2]:
+                x1 = min(x1, float(b[0])) if b[1] < y1 and b[3] > y0 else x1
+            if b[3] <= g["box"][1]:
+                y0 = max(y0, float(b[3])) if b[0] < x1 and b[2] > x0 else y0
+            if b[1] >= g["box"][3]:
+                y1 = min(y1, float(b[1])) if b[0] < x1 and b[2] > x0 else y1
+        out.append(([x0, y0, x1, y1], len(g["lines"])))
+    return out
+
+
+def reading_slot(boxes, region):
+    """where a rescued region goes among a page's blocks (their boxes in reading order): before the first block below it in
+    the same column, else after the last block above it in that column, else at the end"""
+    x0, y0, x1, y1 = region
+    same = lambda b: min(b[2], x1) - max(b[0], x0) > 0.3 * min(b[2] - b[0], x1 - x0)
+    for k, b in enumerate(boxes):
+        if same(b) and b[1] >= y0 - 2:
+            return k
+    above = [k for k, b in enumerate(boxes) if same(b) and b[3] <= y1 + 2]
+    return above[-1] + 1 if above else len(boxes)
+
+
+def _plain_html(html):
+    """OCR html worth keeping: text left after the tags, and no line repeated three times or more (an OCR loop)"""
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    if len(text.split()) < 1:
+        return ""
+    rows = [r.strip() for r in re.split(r"<br\s*/?>|</p>|\n", html or "") if r.strip()]
+    if rows and max(rows.count(r) for r in rows) >= 3 and len(rows) >= 3:
+        return ""
+    return html
+
+
+def rescue_missed_text(document, rec_model, engine, seen=None):
+    """scans: text lines the layout left in no block (nothing reads them: OCR goes block by block or rebuilds the page
+    from its own blocks) are grouped into padded regions, read by the OCR model (Surya, block mode, as Marker reads a
+    block) and added as Text blocks where they belong in the page's reading order. -> {page: lines rescued}.
+    seen (a dict) gets {page: (text lines, pictures, image width)} as Indra found them, for layout_of(detected=...)
+    engine: Indra (detect_all, detect, recognize): finds the lines, and decides a region is this page's text (readable)
+    before Surya is asked to read it"""
+    from surya.layout.schema import LayoutBox, LayoutResult
+    from marker.schema import BlockTypes
+    from marker.schema.polygon import PolygonBox
+    from marker.schema.registry import get_block_class
+    rescued = {}
+    for page in document.pages:
+        if getattr(page, "text_extraction_method", None) == "pdftext":
+            continue                               # digital: Marker places stray lines itself
+        img = page.get_image(highres=True).convert("RGB")
+        gray = np.asarray(img.convert("L"))
+        found, pics = engine.detect_all(gray)
+        if seen is not None:
+            seen[page.page_id] = (found, pics, img.width)
+        kx, ky = img.width / page.polygon.width, img.height / page.polygon.height
+        structure = page.structure_blocks(document)
+        boxes = [[b.polygon.bbox[0] * kx, b.polygon.bbox[1] * ky, b.polygon.bbox[2] * kx, b.polygon.bbox[3] * ky] for b in structure]
+        regions = [(r, n) for r, n in missed_regions(found, pics, boxes, img.size) if readable(engine, gray, r)]
+        if not regions:
+            continue
+        lay = [LayoutBox(polygon=[[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]], label="Text", raw_label="Text",
+                         position=k, count=RESCUE_TOKENS) for k, (r, _) in enumerate(regions)]
+        result = rec_model(images=[img], layout_results=[LayoutResult(bboxes=lay, image_bbox=[0, 0, *img.size])], full_page=False)[0]
+        text_cls = get_block_class(BlockTypes.Text)
+        n = 0
+        for (r, lines), br in zip(regions, result.blocks):
+            html = _plain_html(getattr(br, "html", "")) if not (getattr(br, "error", False) or getattr(br, "skipped", False)) else ""
+            if not html:
+                continue
+            poly = PolygonBox.from_bbox([r[0] / kx, r[1] / ky, r[2] / kx, r[3] / ky]).fit_to_bounds((0, 0, *page.polygon.size))
+            block = page.add_block(text_cls, poly)
+            block.structure = []
+            block.text_extraction_method = "surya"
+            block.html = html
+            slot = reading_slot(boxes, r)
+            page.structure.insert(slot, block.id)
+            boxes.insert(slot, r)
+            n += lines
+        if n:
+            rescued[page.page_id] = n
+    return rescued

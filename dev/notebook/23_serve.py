@@ -11,7 +11,7 @@ try:
             if not alive(f"llm{g}"):
                 print(time.strftime("%H:%M:%S"), f"vision LLM on GPU {g} died; restarting\n" + log_tail(f"llm{g}", 6)); start_llm(g, *LLM_RUN[g])
         if LLM_URL and not alive("lb_llm"): start("lb_llm", f"{sys.executable} mdbox/lb.py {LLM_LB_PORT} {' '.join(map(str, LLM_SERVERS.values()))}")
-        if VLM_URL and not alive("lb"): start("lb", f"{sys.executable} mdbox/lb.py {VLM_LB_PORT} {' '.join(map(str, VLM_PORTS))}")
+        if VLM_URL and not alive("lb"): start("lb", f"LB_MAX_INFLIGHT={VLM_LB_MAX_INFLIGHT} {sys.executable} mdbox/lb.py {VLM_LB_PORT} {' '.join(map(str, VLM_PORTS))}")
         if fails["api"] >= 2: print(time.strftime("%H:%M:%S"), "API down; restarting (job history in memory is lost)\n" + log_tail("api", 8)); start_api(); fails["api"] = 0
         if fails["net"] >= 2: print(time.strftime("%H:%M:%S"), "tunnel down; restarting"); PUBLIC_URL = network_up(); print("   new url:", PUBLIC_URL); fails["net"] = 0
         try: h = api_get("/health")

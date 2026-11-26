@@ -6,8 +6,10 @@ import json, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if len(sys.argv) > 1 and sys.argv[1].startswith("-"):       # "build_nb.py -q" once wrote the notebook to a file named "-q"
+    sys.exit("usage: python dev/build_nb.py [out.ipynb]  (no options)")
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parent / "docs_to_markdown_cloudflare.ipynb"
-MODULES = ["convert.py", "figures.py", "review.py", "lb.py", "worker.py", "pipeline.py", "server.py"]      # dependencies first
+MODULES = ["convert.py", "figures.py", "review.py", "spreads.py", "lb.py", "worker.py", "pipeline.py", "server.py"]      # dependencies first
 
 
 def cell(kind, text):

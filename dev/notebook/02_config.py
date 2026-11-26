@@ -5,6 +5,14 @@ API_PORT      = 8000
 ANNOUNCE      = True        # post the temporary tunnel address (signed, no secrets) to a private ntfy.sh topic so your PC finds it
 MAX_UPLOAD_GB = 3
 RESULTS_DIR   = "/kaggle/tmp/jobs"   # "jobs" would keep every result in the saved notebook output
+EXPRESS_BOX   = False       # True = an express-only box: the vision LLM is not started, its GPU memory goes to Surya
+                            # (EXPRESS_VLM_SLOTS per GPU), more workers run (EXPRESS_WORKERS_PER_CPU) and jobs default to express.
+                            # Measured: NOT faster for express jobs (Surya's speed is the limit, an idle vision LLM costs it nothing);
+                            # it only starts a few minutes sooner and uses less GPU memory. Keep False to have all three qualities
+EXPRESS_VLM_SLOTS = 16          # 3-copy load test (81 pages): 16 slots and 8 workers 387 pages/h; 24 slots and 12 workers
+EXPRESS_WORKERS_PER_CPU = 2.0   #   334 pages/h (more requests in flight, GPUs no busier: images are encoded one at a time)
+EXPRESS_MEM_PER_WORKER_GB = 3.0
+EXPRESS_LB_MAX_INFLIGHT = 0     # tuned (dev/tune_vlm_cap.py, 54 pages): no cap 346 pages/h; caps 4/6/8/12: 305/278/318/315
 
 # ---- conversion engine
 MARKER_SOURCE = "git+https://github.com/datalab-to/marker.git@b578dc88412984b7531bd4a5b4886eb2d2c58da1"   # your PC must use the same version
@@ -12,12 +20,19 @@ OFFICE_VIA_LIBREOFFICE = True   # LibreOffice: .doc/.ppt/.xls/.odt/.rtf... and .
 
 # ---- GPU programs (llama.cpp)
 LLAMA_PREBUILT = True       # download llama.cpp's released CUDA build (~30 s) instead of compiling it (~15 min)
-LLAMA_CPP_REF = "master"    # llama.cpp release / git ref (pin one if a new release ever breaks)
+LLAMA_CPP_REF = "b12627"    # llama.cpp release the box was measured with (its --help: dev/fixtures). "master" = the newest
+                            # release: llama.cpp ships daily and renames flags (--no-mmap -> --load-mode none broke every server once)
 USE_VLM       = True        # Surya VLM on the GPUs; False = CPU-only (fast / no_ocr modes)
 VLM_SLOTS_PER_GPU = 8       # parallel Surya requests per GPU (halved automatically if a GPU runs out of memory)
 VLM_LB_PORT   = 8090        # load balancer in front of the Surya servers
+VLM_FLAG_VARIANTS = ["-fa on -ub 1024", ""]   # Surya's llama-server settings, fastest first; the next is tried if a server won't
+                            # start. Flash attention is exact (same output, faster with long contexts; the vision LLM already uses
+                            # it on these T4s); -ub 1024: a ~1500-token page image is processed in 2 steps, not 3. KV-cache
+                            # quantization is not used for Surya (slightly lossy)
+VLM_LB_MAX_INFLIGHT = 0     # Surya requests in flight per GPU at most (0 = as many as the slots take); also settable on a running
+                            # box: POST /vlm/lb-config {"max_inflight": n} (dev/tune_vlm_cap.py measures which is fastest)
 
-# ---- vision LLM for Marker's quality passes (tables, equations, forms, headings) and figure content
+# ---- vision LLM: page triage, checks, audit and rewrites, figure descriptions (standard and precise)
 LLM_LOCAL     = True        # False = only Gemini (GOOGLE_API_KEY secret), or no LLM passes
 LLM_NAME      = "qwen3-vl-8b"
 LLM_REPO      = "unsloth/Qwen3-VL-8B-Instruct-GGUF"   # one server per T4, next to Surya
@@ -48,17 +63,25 @@ JOB_DEFAULTS = dict(
     MEM_GPU_SERVER_MAX_GB=5.0,  # ... and a GPU server (llama-server) bigger than this is restarted instead (the watchdog brings it back);
                                 #     an LLM server is ~2.3 GB + up to LLM_HOST_CACHE_MB of prompt cache
     MEM_KILL_FREE_GB=2.0,   # ... less than this: the biggest busy worker is stopped and its piece converted again (checked every 0.5 s)
-    MODE="auto",            # auto = balanced when Surya runs, else fast (client: --mode)
+    MODE="auto",            # Marker's reading mode, not the quality: auto = Marker's balanced when Surya runs, else fast (--mode)
     OFFICE="pdf",           # pdf = LibreOffice renders office files to PDF first; native = Marker reads .docx/.pptx itself (--office)
     USE_LLM=True,           # the LLM passes on every job when an LLM runs (client: --no-llm = faster)
-    REDO_INLINE_MATH=None,  # None = as the quality says (accurate: yes); True/False forces Marker's inline-maths rewrite
-    QUALITY="balanced",     # fast / balanced / accurate (client: --quality). fast: no page review, light figure text, no Marker LLM steps;
-                            # balanced: + Marker's LLM steps, page review, figures cropped to themselves, flow diagrams as Mermaid;
-                            # accurate: + review section by section, line-by-line audit with every fix double-checked (slowest)
+    REDO_INLINE_MATH=None,  # None = off (no quality uses Marker's own LLM steps); True = those steps with its inline-maths rewrite (--redo-math)
+    QUALITY="standard",     # express / standard / precise (client: --quality; old names still work). express: no vision-LLM
+                            # pass; standard: the vision LLM only where it pays (a page its own text settles gets no call, the
+                            # others a short look, then an audit, the element check, or also a finer audit for hard pages;
+                            # figures with diagrams/charts described); precise: every pass on every page (element check,
+                            # line-by-line rewrite, fine audit, prose made explicit, every figure described). No step runs twice
     DESCRIBE_FIGURES=None,  # None = as the quality says; True/False forces it (client: --no-describe)
-    PAGE_REVIEW=None,       # None = as the quality says; True/False forces it (client: --no-review)
+    PAGE_REVIEW=None,       # None = as the quality says (no quality uses the whole-page review); True forces it. --no-review turns every page pass off
     SPLIT_MIN_PAGES=8,      # PDFs with at least this many pages are split into page chunks shared by all workers (and your PC); 0 = never
     CHUNK_MAX_PAGES=24,     # pages per chunk at most: smaller chunks = less RAM per worker
     DOC_TIMEOUT_MIN=90,     # a document (or chunk) that takes longer is stopped and reported as failed
     TIME_BUDGET_H=7.0,
 )
+if EXPRESS_BOX:             # no Qwen: Surya gets the GPUs, the workers keep more of its requests in flight
+    LLM_LOCAL, VLM_SLOTS_PER_GPU, VLM_LB_MAX_INFLIGHT = False, EXPRESS_VLM_SLOTS, EXPRESS_LB_MAX_INFLIGHT
+    JOB_DEFAULTS.update(QUALITY="express", USE_LLM=False, WORKERS_PER_CPU=EXPRESS_WORKERS_PER_CPU,
+                        MEM_PER_WORKER_GB=EXPRESS_MEM_PER_WORKER_GB)
+    # (3-page chunks so all 8 workers get one of a 27-page PDF were measured slower: 375 s vs 283 s, Marker's time per chunk
+    #  is mostly fixed; long documents fill all workers anyway)

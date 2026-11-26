@@ -5,7 +5,8 @@
   python md_client.py book.pdf slides.ppt report.doc notes.epub data.csv --out ./md
   python md_client.py ./my_folder --out ./md            # every document in the folder (sub-folders are kept)
   python md_client.py ./my_folder --local 3             # also convert on 3 Marker workers on this PC (default: auto)
-  python md_client.py scan.pdf --mode vllm              # slowest, most accurate (VLM reads every page)
+  python md_client.py book.pdf --quality express        # fastest: no vision-LLM pass (standard = default, precise = slowest)
+  python md_client.py scan.pdf --mode vllm              # Marker's layout/OCR engine: Surya reads every page whole
   python md_client.py paper.pdf --pages 0-9             # only pages 0-9
   python md_client.py big.pdf --no-llm                  # skip the vision-LLM passes (faster, less exact tables/math/figure text)
   python md_client.py notes.docx --office native        # Marker reads the .docx itself (faster, keeps links; Word equations are lost)
@@ -22,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+__version__ = "2.0.0"
 HERE = Path(__file__).resolve().parent
 BOX_NAME = "markdown"
 DOC_EXT = (".bmp", ".csv", ".djv", ".djvu", ".doc", ".docm", ".docx", ".dot", ".dotx", ".epub", ".fodp", ".fods", ".fodt", ".gif", ".htm", ".html", ".jpeg", ".jpg",
@@ -48,6 +50,8 @@ def token():
 
 
 RETRY_HTTP = (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530)   # 530 = Cloudflare lost the tunnel
+QUALITIES = ("express", "standard", "precise")          # = review.QUALITIES on the box, fastest first
+QUALITY_ALIASES = {"superfast": "express", "fast": "express", "balanced": "standard", "auto": "standard", "accurate": "precise"}
 
 
 class Box:
@@ -321,6 +325,9 @@ def combine_rows(label, rows, output_dir):
         row["stage_seconds"] = stages
     if any(r.get("quality") for r in rows):
         row["quality"] = next(r["quality"] for r in rows if r.get("quality"))
+    levels = {k: v for r in rows for k, v in (r.get("page_levels") or {}).items()}
+    if levels:                                         # standard: the level each page got, over all batches
+        row["page_levels"] = dict(sorted(levels.items(), key=lambda kv: int(kv[0])))
     res = [(r["box_resources"], r.get("seconds") or 1) for r in rows if r.get("box_resources")]
     if res:                                            # the box's use over all batches, weighted by their time
         w = sum(t for _, t in res)
@@ -330,6 +337,9 @@ def combine_rows(label, rows, output_dir):
                                 "gpu_mem_max_mb": [max(x["gpu_mem_max_mb"][i] for x, _ in res if len(x.get("gpu_mem_max_mb") or []) > i)
                                                    for i in range(max(len(x.get("gpu_mem_max_mb") or []) for x, _ in res))],
                                 "ram_free_min_gb": min(x.get("ram_free_min_gb", 99) for x, _ in res)}
+        low = min((x for x, _ in res if x.get("ram_at_min")), key=lambda x: x.get("ram_free_min_gb", 99), default=None)
+        if low:                                        # the biggest processes when RAM was lowest (out-of-memory tracking)
+            row["box_resources"]["ram_at_min"] = low["ram_at_min"]
         cpus = [(x["cpu_busy_pct"], t) for x, t in res if x.get("cpu_busy_pct") is not None]
         if cpus:
             row["box_resources"]["cpu_busy_pct"] = round(sum(c * t for c, t in cpus) / sum(t for _, t in cpus))
@@ -340,9 +350,19 @@ def combine_rows(label, rows, output_dir):
                 audit[k] = audit.get(k, 0) + v
     if audit:
         row["audit"] = audit
-    for key in ("tables_realigned", "table_pictures", "drawn_formulas", "indic_words_fixed", "layer_fixes"):
+    for key in ("tables_realigned", "table_pictures", "drawn_formulas", "indic_words_fixed", "layer_fixes", "pictures_read", "edges_peeled", "figures_cropped_by_llm",
+                "picture_text_kept", "pictures_ocr_only", "spreads_split", "spreads_reordered", "pages_turned"):
         if any(r.get(key) for r in rows):
             row[key] = sum(r.get(key) or 0 for r in rows)
+    trace = {"chunks": [], "pages": {}, "figures": {}, "pictures": {}}   # per chunk / page / figure over all batches (for tuning)
+    for r in rows:
+        for key in trace:
+            if key == "chunks":
+                trace[key] += (r.get("trace") or {}).get(key) or []
+            else:
+                trace[key].update((r.get("trace") or {}).get(key) or {})
+    if trace["chunks"]:
+        row["trace"] = trace
     errors = [f"pages {r['batch']}: {r.get('error')}" for r in rows if not r.get("ok")]
     if errors:
         row["error"] = "; ".join(errors)[:600]
@@ -486,6 +506,19 @@ class Local:
         return u["local_ok"]
 
     def submit(self, info, src, stem, out_dir, opts):
+        if opts.get("SPLIT_SPREADS", True) and str(src).lower().endswith(".pdf") and opts.get("OUTPUT_FORMAT", "markdown") == "markdown":
+            try:                                      # two facing pages in one photo: cut in two, as the box does (pipeline.run_job)
+                import spreads
+                want = self.P.parse_pages(opts.get("PAGE_RANGE"), self.P.pdf_pages(src) or 0)
+                cut = Path(tempfile.mkdtemp(prefix="spreads_", dir=str(self.pool.dir))) / Path(src).name
+                new, page_map, turned = spreads.split_spreads(src, cut, set(want))
+                if page_map:
+                    src, info["spreads_split"], info["pages_turned"] = new, len(page_map) - len(set(page_map)), turned
+                    opts = dict(opts, SPREADS=page_map)
+                    if opts.get("PAGE_RANGE"):
+                        opts["PAGE_RANGE"] = self.P.format_pages(spreads.pages_for(page_map, want))
+            except Exception as e:
+                print(f"   {info['label']}: looking for two-page photos failed ({type(e).__name__}); pages read whole", flush=True)
         tid = self.pool.enqueue({"job": "local", "doc": 0, "src": str(src), "rel": info["label"], "stem": stem, "out": str(out_dir), "opts": opts})
         self.busy[tid] = info
 
@@ -494,7 +527,11 @@ class Local:
         for tid in list(self.busy):
             r = self.pool.result(tid)
             if r:
-                yield self.busy.pop(tid), r
+                info = self.busy.pop(tid)
+                if info.get("spreads_split") is not None and r.get("ok"):   # the page count is the original's, as in the box's report
+                    r = dict(r, spreads_split=info["spreads_split"], pages_turned=info.get("pages_turned"),
+                             pages=(r.get("pages") or 0) - info["spreads_split"] or None)
+                yield info, r
 
     def stop(self):
         self.pool.stop()
@@ -765,7 +802,7 @@ class Run:
                     r["low_coverage_pages"] = [c["page"] for c in cov if c["low"]]
                 add_review(r, [r.get("page_review")])
                 self.rows.append({"file": u["label"], "ok": bool(r.get("ok")), "where": "pc", "pages": r.get("pages"), "seconds": r.get("sec"),
-                                  **{k: r[k] for k in ("text_coverage", "low_coverage_pages", "described_figures", "pages_rewritten", "pages_kept_draft", "stage_seconds") if k in r},
+                                  **{k: r[k] for k in ("text_coverage", "low_coverage_pages", "described_figures", "pages_rewritten", "pages_kept_draft", "stage_seconds", "trace", "spreads_split", "spreads_reordered", "pages_turned", "quality", "page_levels") if r.get(k) is not None},
                                   "via": r.get("via"), "error": r.get("error"),
                                   "output_dir": (u["base"] / u["folder"]).relative_to(self.out).as_posix() if r.get("ok") else None})
                 print(f"  [{u['label']}] " + (f"done on this PC in {r.get('sec')} s" if r.get("ok") else f"FAILED on this PC: {r.get('error')}"))
@@ -790,6 +827,9 @@ class Run:
                         row["pages"] = (row.get("pages") or 0) + (r.get("pages") or 0)
                         if r.get("page_review"):                             # and its page-review counts
                             add_review(row, [{k: row[k] for k in ("pages_rewritten", "pages_kept_draft") if k in row}, r["page_review"]])
+                        if r.get("page_levels"):                             # and the level its pages got (standard)
+                            row["page_levels"] = dict(sorted({**(row.get("page_levels") or {}), **r["page_levels"]}.items(),
+                                                             key=lambda kv: int(kv[0])))
                         for k, v in (r.get("stage_seconds") or {}).items():
                             row.setdefault("stage_seconds", {})[k] = round(row.get("stage_seconds", {}).get(k, 0) + v, 1)
             del self.held[jid]
@@ -845,34 +885,55 @@ def main():
     ap.add_argument("--url", help="box address (default: looked up automatically)")
     ap.add_argument("--token", help="BOX_TOKEN (default: .box_token file / BOX_TOKEN env)")
     ap.add_argument("--health", action="store_true", help="show the box status and exit")
+    ap.add_argument("--version", action="version", version=f"md_client.py {__version__}")
     ap.add_argument("--describe-again", metavar="FILE.md", help="write every figure description of a finished .md again with the "
                     "box's vision LLM (images next to it); the old file is kept as .md.bak. No reconversion")
     ap.add_argument("--local", default="auto", help="Marker workers on this PC next to the box: a number, 'auto' (by free memory and cores) or 0. "
                                                     "Needs Marker installed here (see docs/getting-started.md); they use the box's GPUs for the VLM")
-    ap.add_argument("--mode", choices=["auto", "no_ocr", "fast", "balanced", "vllm"], help="auto = balanced on the GPU box (default); vllm = full-page VLM on every page; fast/no_ocr = CPU only")
+    ap.add_argument("--mode", choices=["auto", "no_ocr", "fast", "balanced", "vllm"], help="Marker's layout/OCR engine (not the "
+                    "quality, see --quality): auto = Marker's balanced on the GPU box (default); vllm = full-page VLM on every page; fast/no_ocr = CPU only")
     ap.add_argument("--office", choices=["pdf", "native"], help="pdf = LibreOffice renders office files first, keeping equations and layout (default); native = Marker reads .docx/.pptx itself")
     ap.add_argument("--format", choices=["markdown", "html", "json", "chunks"], dest="fmt", help="output format (default markdown)")
     ap.add_argument("--pages", help="only these pages, numbered from 0, e.g. 0,5-10,20")
     ap.add_argument("--force-ocr", action="store_true", help="OCR every page even if it has a text layer (bad/garbled text)")
     ap.add_argument("--strip-ocr", action="store_true", help="drop an existing bad OCR text layer and OCR again")
-    ap.add_argument("--redo-math", action="store_true", help="rewrite inline math as LaTeX with the LLM (default on the box when its LLM runs)")
+    ap.add_argument("--redo-math", action="store_true", help="also run Marker's own LLM steps, which rewrite inline maths as LaTeX (and "
+                                                             "redo tables, forms, equations); slower, no quality does it by itself")
     ap.add_argument("--llm", action="store_true", help="force the vision-LLM passes on: tables, equations, forms, headings, figure text "
                                                        "(default: on when the box runs its own LLM; with only a GOOGLE_API_KEY it uses Gemini)")
     ap.add_argument("--no-llm", action="store_true", help="skip the vision-LLM passes (faster)")
     ap.add_argument("--no-describe", action="store_true", help="do not write out the text/data inside figures under each image")
-    ap.add_argument("--no-review", action="store_true", help="skip the page-by-page check of the Markdown against each page image (faster)")
+    ap.add_argument("--no-review", action="store_true", help="skip the vision LLM's page-by-page checks against each page image: audit, "
+                                                             "inspection, line pass (faster; figures are still described)")
     ap.add_argument("--paginate", action="store_true", help="put a page-number separator between pages")
     ap.add_argument("--keep-headers", action="store_true", help="keep running page headers and footers")
-    ap.add_argument("--quality", choices=("fast", "balanced", "accurate"),
-                    help="fast = no page review, light figure text; balanced (box default) = page review + full figure text; "
-                         "accurate = review section by section + a line-by-line audit with each fix double-checked (slowest)")
+    ap.add_argument("--quality", type=str.lower, choices=QUALITIES + tuple(QUALITY_ALIASES), metavar="{" + ",".join(QUALITIES) + "}",
+                    help="express = no vision-LLM pass (Marker + Surya OCR + every fix without a model; fastest); standard (box default) = "
+                         "the vision LLM only where it pays: a page the PDF's own text settles gets no call, the others one short look, "
+                         "then a whole-page audit (plain text), the element check + audit (tables, maths, code, figures, scans) or also "
+                         "a finer audit (handwriting, hard pages); figures with diagrams or charts described by meaning; "
+                         "precise = every pass on every page: element check, line-by-line rewrite, fine audit, prose made explicit "
+                         "(the original wording kept), every figure described (slowest). Old names still work: "
+                         "superfast/fast = express, balanced/auto = standard, accurate = precise")
     ap.add_argument("--no-images", action="store_true", help="do not extract figures")
+    ap.add_argument("--chunk-rounds", type=int, help="page chunks per box worker for long PDFs (box default 2): more = smaller chunks, a shorter "
+                                                     "tail where a few chunks run alone, more per-chunk overhead (for tuning)")
+    ap.add_argument("--labels", action="store_true", help="label every block with the vision LLM too (handwriting, code, "
+                                                       "titles, charts...) for the report's trace and --show-layout; the Markdown "
+                                                       "is the same; one more short call per page")
+    ap.add_argument("--show-layout", action="store_true", help="also write <name>/layout/: every page with the blocks the layout "
+                                                            "model found drawn on it (type, score) and their boxes as JSON")
+    ap.add_argument("--no-split-spreads", action="store_true", help="read a photo or scan of two facing book pages as one page "
+                                                                 "(default: cut in two first; the OCR misses and repeats lines of a spread)")
     ap.add_argument("--raw-figures", action="store_true", help="keep Marker's own figure crops (default: re-cropped from the page so labels are not cut off and split figures are joined)")
     ap.add_argument("--no-overlap", action="store_true", help="start a batch only after the previous one is saved (workers idle at each batch's tail)")
     ap.add_argument("--keep-on-box", action="store_true", help="do not delete the job from the box after downloading")
     args = ap.parse_args()
     if args.token:
         os.environ["BOX_TOKEN"] = args.token
+    if args.quality in QUALITY_ALIASES:
+        print(f"note: --quality {args.quality} is now called {QUALITY_ALIASES[args.quality]}")
+        args.quality = QUALITY_ALIASES[args.quality]
     box = connect(args)
     if args.health:
         print(json.dumps(box.call("GET", "/health"), indent=2)); return
@@ -883,7 +944,8 @@ def main():
     options = {k: v for k, v in {"MODE": args.mode, "OFFICE": args.office, "OUTPUT_FORMAT": args.fmt, "PAGE_RANGE": args.pages, "FORCE_OCR": args.force_ocr or None,
                                  "STRIP_EXISTING_OCR": args.strip_ocr or None, "REDO_INLINE_MATH": args.redo_math or None,
                                  "USE_LLM": True if args.llm else (False if args.no_llm else None), "DESCRIBE_FIGURES": False if args.no_describe else None,
-                                 "PAGE_REVIEW": False if args.no_review else None, "QUALITY": args.quality,
+                                 "PAGE_REVIEW": False if args.no_review else None, "AUDIT": False if args.no_review else None, "QUALITY": args.quality,
+                                 "CHUNK_ROUNDS": args.chunk_rounds, "SPLIT_SPREADS": False if args.no_split_spreads else None, "SHOW_LAYOUT": args.show_layout or None, "LABEL_BLOCKS": True if args.labels else None,
                                  "PAGINATE": args.paginate or None, "KEEP_HEADERS_FOOTERS": args.keep_headers or None,
                                  "IMAGES": False if args.no_images else None, "FIGURE_FIX": False if args.raw_figures else None}.items() if v is not None}
     out = Path(args.out).resolve()
@@ -906,7 +968,8 @@ def main():
         except KeyboardInterrupt:
             run.cancel(); print("\ncancelled"); sys.exit(130)
         out.mkdir(parents=True, exist_ok=True)
-        (out / "report.json").write_text(json.dumps({"documents": run.rows, "wall_s": round(time.time() - t0)}, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out / "report.json").write_text(json.dumps({"documents": run.rows, "wall_s": round(time.time() - t0), "box": {k: h.get(k) for k in (
+            "code", "llm_model", "llm_slots", "vlm_slots", "workers", "chunk_pages")}, "options": options}, ensure_ascii=False, indent=2), encoding="utf-8")
         ok = sum(1 for r in run.rows if r.get("ok"))
         print(f"done in {time.time() - t0:.0f} s: {ok}/{len(run.rows)} documents ok -> {out}"
               + (f" ({sum(r.get('where') == 'pc' for r in run.rows)} converted on this PC)" if local else ""))
@@ -917,14 +980,21 @@ def main():
                       if "pages_rewritten" in r else "")
             if r.get("quality"):
                 au = r.get("audit") or {}
+                levels = {}
+                for v in (r.get("page_levels") or {}).values():
+                    levels[v] = levels.get(v, 0) + 1
                 print(f"      quality: {r['quality']}" + (f" | line-by-line audit: {au.get('sections', 0)} sections, fixes confirmed by the text "
                       f"layer {au.get('confirmed by the text layer', 0)}, by a second look {au.get('confirmed by a second look', 0)}, "
-                      f"refused {au.get('refused', 0)}" if au else ""))
+                      f"refused {au.get('refused', 0)}" if au else "")
+                      + (" | pages by level: " + ", ".join(f"{k} {levels[k]}" for k in ("none", "audit", "inspect", "hard") if k in levels)
+                         if levels else ""))
             br = r.get("box_resources") or {}
             if br.get("gpu_busy_pct"):
                 print(f"      box while converting: GPUs busy {', '.join(f'{u}%' for u in br['gpu_busy_pct'])}"
                       + (f", CPU {br['cpu_busy_pct']}%" if br.get("cpu_busy_pct") is not None else "")
                       + f", RAM free at least {br.get('ram_free_min_gb')} GB")
+                if br.get("ram_at_min") and br.get("ram_free_min_gb", 99) < 6:
+                    print("      RAM held then by: " + "; ".join(br["ram_at_min"][:6]))
             if r.get("stage_seconds"):
                 tot = sum(r["stage_seconds"].values()) or 1
                 print("      worker time: " + ", ".join(f"{k} {v / 60:.0f} min ({v / tot:.0%})" for k, v in sorted(r["stage_seconds"].items(), key=lambda kv: -kv[1])))
@@ -957,7 +1027,7 @@ def start_local(args, box, h, options, units, tmp):
             print("note: the box uses Gemini for the LLM passes; set GOOGLE_API_KEY here too to convert on this PC")
             return None
         d = h.get("defaults") or {}
-        options.update(USE_LLM=True, QUALITY=options.get("QUALITY") or d.get("QUALITY") or "balanced")
+        options.update(USE_LLM=True, QUALITY=options.get("QUALITY") or d.get("QUALITY") or "standard")
         for key in ("REDO_INLINE_MATH", "DESCRIBE_FIGURES", "PAGE_REVIEW"):            # the same stages as the box: set, or as the quality says
             if options.get(key, d.get(key)) is not None:
                 options[key] = bool(options.get(key, d.get(key)))
