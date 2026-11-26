@@ -117,7 +117,8 @@ async def proxy(path: str, request: Request):
         return Response(content=r.content, status_code=r.status_code, headers=out)
     if isinstance(last, httpx.Response):
         return Response(content=last.content, status_code=last.status_code)
-    return Response(content=f"no backend reachable: {last!r}".encode(), status_code=502)
+    print(f"lb: no backend reachable for /{path}: {last!r}", file=sys.stderr, flush=True)   # the details stay in the box's log:
+    return Response(content=b"no backend reachable", status_code=502)                       # callers get no internal error text
 
 
 if __name__ == "__main__":

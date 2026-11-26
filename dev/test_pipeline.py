@@ -1466,7 +1466,14 @@ class TestSuiteFindings(unittest.TestCase):
         r = asyncio.run(lb.proxy("v1/chat/completions", Req()))
         self.assertEqual((r.status_code, [u.split("/v1")[0] for u in seen]), (200, [a, b]))
         self.assertGreater(lb.down_until[a], lb.time.time())                  # skipped for a few seconds
-        lb.inflight.update({a: 0, b: 0})
+
+        class Down:                                                           # both servers gone: a plain 502, and the
+            async def request(self, method, url, **k):                        # internal error (addresses, exception)
+                raise lb.httpx.ConnectError("[Errno 111] Connection refused to 127.0.0.1:8181")   # stays in the log
+        lb.client, lb.down_until[a], lb.down_until[b] = Down(), 0.0, 0.0
+        r = asyncio.run(lb.proxy("v1/chat/completions", Req()))
+        self.assertEqual((r.status_code, r.body), (502, b"no backend reachable"))
+        lb.inflight.update({a: 0, b: 0}); lb.down_until[a] = lb.down_until[b] = 0.0
 
     def test_llm_requests_in_flight_are_capped(self):
         import threading, time, urllib.request

@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Security
+- The GPU load balancer's 502 answer (when no GPU server responds) no longer carries internal error text
+  (addresses, exception details); it goes to the box's log instead. Found by CodeQL.
+
 ## [2.0.0] - 2026-11-26
 
 Three quality modes named by their trade-off, per-page decisions in the default mode, scans and phone photos
