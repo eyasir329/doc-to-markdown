@@ -9,7 +9,7 @@
 
 ## Checklist
 
-- [ ] `python -m pytest -q dev/test_pipeline.py` and `python dev/test_e2e.py` pass
+- [ ] `python -m pytest -q dev/test_pipeline.py`, `python dev/test_e2e.py` and `python dev/modes_check.py` pass
 - [ ] `ruff check .` is clean
 - [ ] notebook rebuilt (`python dev/build_nb.py`) if `dev/notebook/` or `dev/mdbox/` changed
 - [ ] docs and `CHANGELOG.md` (*Unreleased*) updated for user-visible changes

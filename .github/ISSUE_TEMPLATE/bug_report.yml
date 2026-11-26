@@ -32,7 +32,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Release tag or commit of this repository.
+      description: "`python md_client.py --version`, and the box's `code` from `python md_client.py --health` (or the release tag or commit you use)."
     validations:
       required: true
   - type: input

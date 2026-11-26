@@ -11,7 +11,8 @@ every figure. A vision model checks the result, and its changes are only kept if
 [![CI](https://github.com/eyasir329/doc-to-markdown/actions/workflows/ci.yml/badge.svg)](https://github.com/eyasir329/doc-to-markdown/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/eyasir329/doc-to-markdown)](https://github.com/eyasir329/doc-to-markdown/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Client: Python 3.10+](https://img.shields.io/badge/client-Python%203.10%2B%2C%20no%20dependencies-3776AB.svg)](md_client.py)[![Runs on: Kaggle 2×T4](https://img.shields.io/badge/runs%20on-Kaggle%202%C3%97T4%20(free)-20BEFF.svg)](docs/getting-started.md)
+[![Client: Python 3.10+](https://img.shields.io/badge/client-Python%203.10%2B%2C%20no%20dependencies-3776AB.svg)](md_client.py)
+[![Runs on: Kaggle 2×T4](https://img.shields.io/badge/runs%20on-Kaggle%202%C3%97T4%20(free)-20BEFF.svg)](docs/getting-started.md)
 
 [Getting started](docs/getting-started.md) ·
 [Usage](docs/usage.md) ·
@@ -38,7 +39,8 @@ every figure. A vision model checks the result, and its changes are only kept if
 - **Scans and phone photos handled.** Pages are set upright, a photo of two facing book pages is cut into its two
   pages, and text the layout missed is still read.
 - **Figures are content, not decoration.** Figures are cropped to the figure itself, the text inside them is read,
-  and each one is described by its meaning. Flowcharts become [Mermaid](https://mermaid.js.org/) charts.
+  and each one is described by its meaning. Flowcharts, UML activity, state and sequence diagrams, workflows and
+  trees become [Mermaid](https://mermaid.js.org/) charts.
 - **Every script.** Bengali, Hindi and other Indic scripts, Chinese, Japanese, Hebrew, Arabic, Cyrillic and more,
   with repairs for the typical OCR and PDF-text errors of Indic scripts.
 - **Long books and many files.** Documents are split into page chunks and spread over all workers. Long

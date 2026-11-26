@@ -33,7 +33,7 @@ See [docs/development.md](docs/development.md). In short:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest -q dev/test_pipeline.py && python dev/test_e2e.py && ruff check .
+python -m pytest -q dev/test_pipeline.py && python dev/test_e2e.py && python dev/modes_check.py && ruff check .
 ```
 
 ## Rules of the codebase
@@ -51,7 +51,7 @@ python -m pytest -q dev/test_pipeline.py && python dev/test_e2e.py && ruff check
 
 ## Pull request checklist
 
-- [ ] `python -m pytest -q dev/test_pipeline.py` and `python dev/test_e2e.py` pass
+- [ ] `python -m pytest -q dev/test_pipeline.py`, `python dev/test_e2e.py` and `python dev/modes_check.py` pass
 - [ ] `ruff check .` is clean
 - [ ] the notebook is rebuilt (`python dev/build_nb.py`) if `dev/notebook/` or `dev/mdbox/` changed
 - [ ] the docs are updated for any user-visible change, and `CHANGELOG.md` has an entry under *Unreleased*

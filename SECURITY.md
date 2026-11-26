@@ -23,7 +23,8 @@ while it runs. What protects it:
 | **Uploads** | Server-generated job and file IDs. A part is refused as soon as it exceeds the declared size. Total size is capped (`MAX_UPLOAD_GB`). Zip archives are checked for path traversal, file count and unpacked size |
 | **Downloads** | Paths are resolved and must stay inside the job's own folder |
 | **Isolation** | Each document is converted in a worker process. Results are stored in `/kaggle/tmp`, which isn't saved with the notebook version, and are deleted from the box after download unless you pass `--keep-on-box` |
-| **Abandoned jobs** | A job no client has asked about for 15 minutes is cancelled |
+| **Input validation** | Unknown options, wrong types, invalid values and malformed numbers or bodies are refused with HTTP 400 |
+| **Abandoned work** | A job or upload no client has asked about for 15 minutes is cancelled and its data deleted; stored files no job uses are removed after the same time |
 
 ## Your responsibilities
 
