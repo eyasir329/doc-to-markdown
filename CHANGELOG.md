@@ -6,9 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-26
+
+A security patch for the box; conversion results are unchanged.
+
 ### Security
 - The GPU load balancer's 502 answer (when no GPU server responds) no longer carries internal error text
-  (addresses, exception details); it goes to the box's log instead. Found by CodeQL.
+  (addresses, exception details), which the API's `/vlm` and `/llm` proxies passed on to the caller; it goes to the
+  box's log instead. Found by CodeQL.
+
+### Changed
+- `md_client.py` is executable, so `./md_client.py` works on Linux and macOS.
+- `SECURITY.md` lists the 2.0 protections: input validation and the removal of abandoned uploads and stored files.
 
 ## [2.0.0] - 2026-11-26
 
@@ -109,6 +118,7 @@ First public release.
 - Token-protected HTTP API with constant-time token check, upload size caps and path-traversal protection.
   Abandoned jobs are cancelled after 15 minutes.
 
-[Unreleased]: ../../compare/v2.0.0...HEAD
+[Unreleased]: ../../compare/v2.0.1...HEAD
+[2.0.1]: ../../compare/v2.0.0...v2.0.1
 [2.0.0]: ../../compare/v1.0.0...v2.0.0
 [1.0.0]: ../../releases/tag/v1.0.0

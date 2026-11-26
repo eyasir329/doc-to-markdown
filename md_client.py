@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 HERE = Path(__file__).resolve().parent
 BOX_NAME = "markdown"
 DOC_EXT = (".bmp", ".csv", ".djv", ".djvu", ".doc", ".docm", ".docx", ".dot", ".dotx", ".epub", ".fodp", ".fods", ".fodt", ".gif", ".htm", ".html", ".jpeg", ".jpg",
